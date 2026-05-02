@@ -26,10 +26,10 @@ import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
+import traceback
+
 from model.network import UASTHN
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning, message=".*autocast.*")
-warnings.filterwarnings("ignore", category=UserWarning, message=".*meshgrid.*")
+# from model.network import UASTHN
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -716,11 +716,11 @@ def run_js_loop(cli_args):
                         f"Sat{sat_idx}_T{th_idx}"
                     )
 
+                # print(f"✅ Done image {i + 1}/{cli_args.num_samples} in {elapsed:.3f} sec")
             except Exception as e:
                 error_count += 1
                 if error_count <= 3:
-                    logger.error(f"Error image {i}: {e}")
-                    import traceback
+                    logger.error(f"❌ Error image {i}: {e}")
                     traceback.print_exc()
                 # ADDED: sat_idx and th_idx in the error row
                 # For skip case (8 NaN for coordinates + img1_path + img2_path + img1_path + img2_path + NaN + 0)
