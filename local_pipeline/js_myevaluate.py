@@ -8,8 +8,10 @@ import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
+import traceback
 
-from model.network import UASTHN
+# from model.network import UASTHN
+from model.js_network import UASTHN
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -219,39 +221,43 @@ def run_js_loop(cli_args):
 
     with torch.inference_mode():
         for i in iterator:
-            sat_idx = i // cli_args.tiles_per_satellite + 1
-            th_idx = i % cli_args.tiles_per_satellite + 1
+            try:
+                sat_idx = i // cli_args.tiles_per_satellite + 1
+                th_idx = i % cli_args.tiles_per_satellite + 1
 
-            img1_path = os.path.join(satellite_dir, f"{sat_idx}.tif")
-            img2_path = os.path.join(thermal_dir, f"{sat_idx}_{th_idx}.tif")
+                img1_path = os.path.join(satellite_dir, f"{sat_idx}.tif")
+                img2_path = os.path.join(thermal_dir, f"{sat_idx}_{th_idx}.tif")
 
-            if not os.path.exists(img1_path) or not os.path.exists(img2_path):
-                print(f"Skip index {i}: missing image file.")
-                continue
+                if not os.path.exists(img1_path) or not os.path.exists(img2_path):
+                    print(f"Skip index {i}: missing image file.")
+                    continue
 
-            img1 = TF.to_tensor(Image.open(img1_path).convert("RGB")).unsqueeze(0)
-            img2 = thermal_transform(Image.open(img2_path)).unsqueeze(0)
+                img1 = TF.to_tensor(Image.open(img1_path).convert("RGB")).unsqueeze(0)
+                img2 = thermal_transform(Image.open(img2_path)).unsqueeze(0)
 
-            if args.device.type == "cuda":
-                torch.cuda.synchronize(args.device)
-            start_time = time.perf_counter()
+                if args.device.type == "cuda":
+                    torch.cuda.synchronize(args.device)
+                start_time = time.perf_counter()
 
-            four_pred = _predict_four_points(model, img1, img2, args)
+                four_pred = _predict_four_points(model, img1, img2, args)
 
-            if args.device.type == "cuda":
-                torch.cuda.synchronize(args.device)
-            elapsed = time.perf_counter() - start_time
-            times.append(elapsed)
+                if args.device.type == "cuda":
+                    torch.cuda.synchronize(args.device)
+                elapsed = time.perf_counter() - start_time
+                times.append(elapsed)
 
-            four_point_1 = four_pred + four_point_org_single
-            four_point_1 = four_point_1.flatten(2).permute(0, 2, 1).contiguous()
-            four_point_1 = four_point_1 * scale
+                four_point_1 = four_pred + four_point_org_single
+                four_point_1 = four_point_1.flatten(2).permute(0, 2, 1).contiguous()
+                four_point_1 = four_point_1 * scale
 
-            points = four_point_1.squeeze(0).cpu().tolist()
-            flat_points = [coord for point in points for coord in point]
-            all_corners.append([i] + flat_points + [img1_path, img2_path])
+                points = four_point_1.squeeze(0).cpu().tolist()
+                flat_points = [coord for point in points for coord in point]
+                all_corners.append([i] + flat_points + [img1_path, img2_path])
 
-            print(f"Done image {i + 1}/{cli_args.num_samples} in {elapsed:.3f} sec")
+                print(f"✅ Done image {i + 1}/{cli_args.num_samples} in {elapsed:.3f} sec")
+            except Exception as e:
+                print(f'❌ Error in image {i}: {e}')
+                traceback.print_exc()
 
     if times:
         start_idx = min(cli_args.warmup_skip, len(times))
@@ -306,4 +312,5 @@ def parse_cli_args():
 
 
 if __name__ == "__main__":
+    os.system('sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches')
     run_js_loop(parse_cli_args())
