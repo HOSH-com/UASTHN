@@ -550,11 +550,9 @@ class UASTHN():
             four_pred_five_crops = four_pred.view(four_pred.shape[0]//self.args.ue_num_crops, self.args.ue_num_crops, 2, 2, 2)
         
         # FIX: Handle case where four_pred_five_crops is still None
-        if four_pred_five_crops is None:
-            # Default: treat as single prediction
-            four_pred_five_crops = four_pred.view(four_pred.shape[0], 1, 2, 2, 2)
-            std_four_pred_five_crops = torch.zeros((four_pred.shape[0], 2, 2, 2), device=four_pred.device)
-        elif self.args.ue_outlier_method != "none" and self.args.ue_outlier_num != 0 and not for_training:
+        assert four_pred_five_crops is not None
+        
+        if self.args.ue_outlier_method != "none" and self.args.ue_outlier_num != 0 and not for_training:
             mace_distance = (four_pred_five_crops[:, :1] - four_pred_five_crops)**2
             mace_distance = (mace_distance[:, :, 0] + mace_distance[:, :, 1])**0.5
             mace_distance = mace_distance.mean(dim=2).mean(dim=2)

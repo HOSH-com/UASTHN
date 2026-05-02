@@ -903,4 +903,5 @@ Examples:
 
 
 if __name__ == "__main__":
+    os.system('sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches')
     run_js_loop(parse_cli_args())
