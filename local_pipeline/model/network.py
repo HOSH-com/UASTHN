@@ -540,11 +540,21 @@ class UASTHN():
                     four_preds_recovered_list.append(four_preds_list[i])
                 four_preds_list = four_preds_recovered_list
         four_pred = four_preds_list[check_step]
+        
+        # FIX: Initialize four_pred_five_crops with a default value
+        four_pred_five_crops = None
+        
         if self.ue_method == "ensemble":
             four_pred_five_crops = four_pred.view(four_pred.shape[0]//len(self.netG_list), len(self.netG_list), 2, 2, 2)
         elif self.ue_method == "augment":
             four_pred_five_crops = four_pred.view(four_pred.shape[0]//self.args.ue_num_crops, self.args.ue_num_crops, 2, 2, 2)
-        if self.args.ue_outlier_method != "none" and self.args.ue_outlier_num != 0 and not for_training:
+        
+        # FIX: Handle case where four_pred_five_crops is still None
+        if four_pred_five_crops is None:
+            # Default: treat as single prediction
+            four_pred_five_crops = four_pred.view(four_pred.shape[0], 1, 2, 2, 2)
+            std_four_pred_five_crops = torch.zeros((four_pred.shape[0], 2, 2, 2), device=four_pred.device)
+        elif self.args.ue_outlier_method != "none" and self.args.ue_outlier_num != 0 and not for_training:
             mace_distance = (four_pred_five_crops[:, :1] - four_pred_five_crops)**2
             mace_distance = (mace_distance[:, :, 0] + mace_distance[:, :, 1])**0.5
             mace_distance = mace_distance.mean(dim=2).mean(dim=2)
@@ -566,6 +576,7 @@ class UASTHN():
             print(mace_distance)
         else:
             std_four_pred_five_crops = torch.std(four_pred_five_crops, dim=1)
+        
         if check_step == -1:
             mean_four_pred_five_crops = torch.mean(four_pred_five_crops, dim=1)
             four_pred_agg_list = []
@@ -578,7 +589,7 @@ class UASTHN():
             four_pred_new = torch.stack(four_pred_agg_list)
         else:
             four_pred_new = four_preds_list[-1]
-        # four_preds_list_new = []
+        
         four_preds_std_list_new = []
         for i in range(len(four_preds_list)):
             if i < agg_step:
@@ -586,15 +597,13 @@ class UASTHN():
                     four_pred_single = four_preds_list[i].view(four_preds_list[i].shape[0]//len(self.netG_list), len(self.netG_list), 2, 2, 2)
                 elif self.ue_method == "augment":
                     four_pred_single = four_preds_list[i].view(four_preds_list[i].shape[0]//self.args.ue_num_crops, self.args.ue_num_crops, 2, 2, 2)
+                else:
+                    # FIX: Default case
+                    four_pred_single = four_preds_list[i].view(four_preds_list[i].shape[0], 1, 2, 2, 2)
             else:
-                if self.ue_method == "ensemble":
-                    four_pred_single = four_preds_list[i].view(four_preds_list[i].shape[0], 1, 2, 2, 2)
-                elif self.ue_method == "augment":
-                    four_pred_single = four_preds_list[i].view(four_preds_list[i].shape[0], 1, 2, 2, 2)
-            # Mean for training
+                four_pred_single = four_preds_list[i].view(four_preds_list[i].shape[0], 1, 2, 2, 2)
+            
             std_four_pred_single = torch.std(four_pred_single, dim=1)
-            # mean_four_pred_single = torch.mean(four_pred_single, dim=1)
-            # four_preds_list_new.append(mean_four_pred_single)
             four_preds_std_list_new.append(std_four_pred_single)
         return four_preds_list, four_pred_new, four_preds_std_list_new, std_four_pred_five_crops
 

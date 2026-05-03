@@ -119,9 +119,11 @@ def _strip_module_prefix(state_dict):
 
 def _resolve_path(path):
     """Resolve path relative to project root"""
-    if os.path.isabs(path):
-        return path
-    return os.path.join(PROJECT_ROOT, path)
+    if path is None or path == "" or str(path).strip() == "":
+        return None
+    if os.path.isabs(str(path)):
+        return str(path)
+    return os.path.join(PROJECT_ROOT, str(path))
 
 
 def _looks_like_ihn_state_dict(state_dict):
@@ -212,12 +214,30 @@ def _build_runtime_args(cli_args):
     args.two_stages = True
     
     # ============================================================
-    # UNCERTAINTY ESTIMATION SETTINGS (ALWAYS SET THESE!)
+    # UNCERTAINTY ESTIMATION SETTINGS
     # ============================================================
     args.first_stage_ue = cli_args.enable_uncertainty
-    args.ue_method = "augment" if cli_args.enable_uncertainty else "single"
-    args.ue_aug_method = "shift"                                          # ADDED
-    args.crop_width = args.resize_width - cli_args.ue_shift               # ADDED: 256 - 32 = 224
+    
+    # Determine UE method:
+    # - "augment_ensemble": CropTTA + Deep Ensembles (when ensemble file exists)
+    # - "augment": CropTTA only (default with uncertainty)
+    # - "single": No uncertainty
+    # Determine UE method:
+    if cli_args.enable_uncertainty:
+        # Check if ensemble file is provided and exists
+        ensemble_file = _resolve_path(cli_args.ensemble_models_file)
+        if ensemble_file is not None and os.path.exists(ensemble_file):
+            args.ue_method = "augment_ensemble"
+            args.ue_ensemble_load_models = ensemble_file
+        else:
+            args.ue_method = "augment"
+            args.ue_ensemble_load_models = None
+    else:
+        args.ue_method = "single"
+        args.ue_ensemble_load_models = None
+    
+    args.ue_aug_method = "shift"
+    args.crop_width = args.resize_width - cli_args.ue_shift  # 256 - 32 = 224
     args.ue_num_crops = cli_args.ue_num_crops if cli_args.enable_uncertainty else 1
     args.ue_shift_crops_types = cli_args.ue_shift_crops_types if cli_args.enable_uncertainty else "random"
     args.ue_shift = cli_args.ue_shift if cli_args.enable_uncertainty else 32
@@ -229,11 +249,8 @@ def _build_runtime_args(cli_args):
     args.ue_rej_std = cli_args.ue_rej_std if cli_args.enable_uncertainty else [float('inf')]
     
     # Outlier settings (used by ue_aggregation)
-    args.ue_outlier_method = "none"      # ADD THIS
-    args.ue_outlier_num = 0              # ADD THIS
-
-    # Ensemble settings (optional)
-    args.ue_ensemble_load_models = cli_args.ensemble_models_file if cli_args.enable_uncertainty else None
+    args.ue_outlier_method = "none"
+    args.ue_outlier_num = 0
     
     # Other settings
     args.weight = False
@@ -249,7 +266,6 @@ def _build_runtime_args(cli_args):
     args.eval_model_fine = _resolve_path(cli_args.eval_model_fine) if cli_args.eval_model_fine else None
     
     return args
-
 
 def _load_model_weights(model, args, logger):
     """Load model weights with detailed logging"""
@@ -872,8 +888,8 @@ Examples:
     parser.add_argument("--check_step", type=int, default=-1, 
                        help="Early stopping check step (-1=disabled)")
     parser.add_argument("--ensemble_models_file", type=str, 
-                       default="./local_pipeline/ensembles/ensemble_512_IHN.txt", 
-                       help="Path to ensemble models list file")
+                   default=None, 
+                   help="Path to ensemble models list file")
 
     # Runtime controls
     parser.add_argument("--jetson_mode", action="store_true", 
