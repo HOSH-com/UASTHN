@@ -298,9 +298,13 @@ class UASTHN():
         
     def forward(self, for_training=False, for_test=False):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
+        
         # time1 = time.time()
+        # Generate Crops & Augment
         if self.args.first_stage_ue and self.ue_method == "augment":
             self.first_stage_ue_generate()
+
+        # Run First Stage
         if self.args.first_stage_ue:
             if self.ue_method == "ensemble":
                 four_preds_list_ensemble = []
@@ -319,15 +323,28 @@ class UASTHN():
                 self.four_preds_list, self.four_pred = self.netG(image1=self.image_1, image2=self.image_2, iters_lev0=self.args.iters_lev0, corr_level=self.args.corr_level)
         else:
             self.four_preds_list, self.four_pred = self.netG(image1=self.image_1, image2=self.image_2, iters_lev0=self.args.iters_lev0, corr_level=self.args.corr_level)
+
+        # First Stage Aggregation
+        # self.four_preds_list = [self.four_preds_list[-1]]
         if self.args.first_stage_ue:
             # for i in range(len(self.four_preds_list)): # DEBUG
             #     self.four_preds_list[i] = self.flow_4cor # DEBUG
             # self.four_pred = self.flow_4cor # DEBUG
-            if self.ue_method == "augment":
-                pass
+            # if self.ue_method == "augment":
+            #     pass
                 # self.fake_warped_image_2_multi_before = mywarp(self.image_2, self.four_preds_list[self.args.check_step], self.four_point_org_single) # Comment for performance evaluation 
+            
+            # print('*** bef four_pred', self.four_pred.shape)
+            # print('*** bef four_preds_list', self.four_preds_list.__len__())
+            # print('*** bef four_preds_list', self.four_preds_list[0].shape)
             if self.ue_method != "single":
                 self.four_preds_list, self.four_pred = self.first_stage_ue_aggregation(self.four_preds_list, for_training)
+            # print('*** aft four_pred', self.four_pred.shape)
+            # print('*** aft four_preds_list', self.four_preds_list.__len__())
+            # print('*** aft four_preds_list', self.four_preds_list[0].shape)
+            # print('*** bef1', self.image_1.shape)
+            # print('*** bef2', self.image_2.shape)
+
             if self.ue_method == "augment":
                 B5, C, H, W = self.image_2.shape
                 # image_2_full = self.image_2.view(B5//self.args.ue_num_crops, self.args.ue_num_crops, C, H, W)[:, :1].repeat(1, self.args.ue_num_crops, 1, 1, 1).view(-1, C, H, W) # Comment for performance evaluation
@@ -338,8 +355,12 @@ class UASTHN():
                 self.image_2 = self.image_2.view(B5//self.args.ue_num_crops, self.args.ue_num_crops, C, H, W)[:, 0]
             elif self.ue_method == "single":
                 self.std_four_pred_five_crops = torch.sqrt(torch.exp(self.four_pred_ue_list[-1]))
+            # print('*** aft1', self.image_1.shape)
+            # print('*** aft2', self.image_2.shape)
         # time2 = time.time()
         # logging.debug("Time for 1st forward pass: " + str(time2 - time1) + " seconds")
+
+        # Run Second Stage
         if self.args.two_stages and not (self.ue_method == "ensemble" and self.args.ue_method == "augment_ensemble"):
             # self.four_pred = self.flow_4cor # DEBUG
             # self.four_preds_list[-1] = self.four_pred # DEBUG
@@ -529,6 +550,7 @@ class UASTHN():
         return bbox_s
 
     def ue_aggregation(self, four_preds_list, alpha, for_training, check_step=-1):
+        
         if check_step == -1:
             agg_step = len(four_preds_list)
         else:
@@ -553,8 +575,7 @@ class UASTHN():
                     four_preds_recovered_list.append(four_preds_list[i])
                 four_preds_list = four_preds_recovered_list
         four_pred = four_preds_list[check_step]
-                
-        # FIX: Initialize four_pred_five_crops with a default value
+        
         four_pred_five_crops = None
         
         if self.ue_method == "ensemble":
@@ -586,6 +607,8 @@ class UASTHN():
             print(mace_distance)
         else:
             std_four_pred_five_crops = torch.std(four_pred_five_crops, dim=1)
+
+        # Aggregate Final Displacement
         if check_step == -1:
             mean_four_pred_five_crops = torch.mean(four_pred_five_crops, dim=1)
             four_pred_agg_list = []

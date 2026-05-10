@@ -28,7 +28,7 @@ from PIL import Image
 from tqdm import tqdm
 import traceback
 
-from model.network import UASTHN
+from model.js_network import UASTHN
 # from model.network import UASTHN
 
 
