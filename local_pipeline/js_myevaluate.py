@@ -26,10 +26,10 @@ import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
-from model.network import UASTHN
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning, message=".*autocast.*")
-warnings.filterwarnings("ignore", category=UserWarning, message=".*meshgrid.*")
+import traceback
+
+from model.js_network import UASTHN
+# from model.network import UASTHN
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -824,11 +824,11 @@ def run_js_loop(cli_args):
                          f"total={elapsed*1000:.0f}ms | load={load_ms:.0f}ms | {stage_str}"
                 )
 
+                # print(f"✅ Done image {i + 1}/{cli_args.num_samples} in {elapsed:.3f} sec")
             except Exception as e:
                 error_count += 1
                 if error_count <= 3:
-                    logger.error(f"Error image {i}: {e}")
-                    import traceback
+                    logger.error(f"❌ Error image {i}: {e}")
                     traceback.print_exc()
                 # Fixed: was appending twice (bug); now appends once
                 all_corners.append([i] + [np.nan]*8 + [img1_path, img2_path, img1_path, img2_path, np.nan, 0])
@@ -1078,4 +1078,5 @@ Examples:
 
 
 if __name__ == "__main__":
+    os.system('sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches')
     run_js_loop(parse_cli_args())
