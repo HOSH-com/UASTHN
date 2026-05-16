@@ -230,6 +230,7 @@ class UASTHN(nn.Module, PyTorchModelHubMixin):
         Returns:
             four_pred: [B, 2, 2, 2] predicted 4-point displacement at resize_width scale
         """
+        # TODO interpolate 
         image_1 = F.interpolate(satellite_image, size=self.resize_width,
                                 mode='bilinear', align_corners=True, antialias=True)
         image_2 = thermal_image
@@ -252,7 +253,7 @@ class UASTHN(nn.Module, PyTorchModelHubMixin):
                              ue_num_crops=5, ue_shift=32,
                              ue_shift_crops_types=None, 
                              firststage_ue=True,
-                             ue_seed=0):
+                             ue_seed=0,test = False):
         """
         CropTTA: Run inference with multiple shifted crops for uncertainty estimation.
         
@@ -342,6 +343,9 @@ class UASTHN(nn.Module, PyTorchModelHubMixin):
         _, four_pred_coarse = self.netG(
             image1=image_1, image2=thermal_cropped,
             iters_lev0=self.iters_lev0, corr_level=self.corr_level)
+        
+        if test:
+            print(four_pred_coarse)
 
         # Decide: firststage_ue or full two-stage
         if firststage_ue:
@@ -392,6 +396,142 @@ class UASTHN(nn.Module, PyTorchModelHubMixin):
         
         # Uncertainty = std across crops
         std_pred = torch.std(recovered_preds, dim=1)
+
+        return four_pred, std_pred
+
+
+    def forward_with_uncertainty_org(self, satellite_image, thermal_image,
+                                 ue_num_crops=5, ue_shift=64,
+                                 ue_shift_crops_types="grid"):
+        """
+        CropTTA: Run inference with multiple shifted crops of the thermal image
+        to estimate uncertainty via prediction std across crops.
+
+        Args:
+            satellite_image: [B, 3, database_size, database_size] RGB satellite (values in [0, 1])
+            thermal_image: [B, 3, resize_width, resize_width] 3-channel thermal (values in [0, 1])
+            ue_num_crops: number of crops (including original), default 5
+            ue_shift: max shift in pixels at resize_width scale, default 64
+            ue_shift_crops_types: "grid" for deterministic grid sampling,
+                                  "random" for random shifts
+
+        Returns:
+            four_pred: [B, 2, 2, 2] predicted displacement (from unshifted crop)
+            std_pred: [B, 2, 2, 2] per-corner std across crops (uncertainty)
+        """
+        device = satellite_image.device
+        B, C, H_th, W_th = thermal_image.shape
+        _, _, H_sat, W_sat = satellite_image.shape
+        rw = self.resize_width
+        rng = np.random.default_rng(seed=0)
+
+        if ue_shift_crops_types == "grid":
+            # Deterministic grid: 2x2 grid of shifts over [0, ue_shift]
+            if ue_num_crops >= 2 and ue_num_crops <= 5:
+                x_shift_grid = np.linspace(0, ue_shift, 2)
+                y_shift_grid = np.linspace(0, ue_shift, 2)
+            else:
+                raise NotImplementedError(
+                    f"Grid mode only supports ue_num_crops 2-5, got {ue_num_crops}")
+            xx, yy = np.meshgrid(x_shift_grid, y_shift_grid)
+            xx = xx.reshape(-1)
+            yy = yy.reshape(-1)
+            idx = list(range(len(xx)))
+            rng.shuffle(idx)
+            idx = idx[:ue_num_crops - 1]
+            selected_x = list(xx[idx])
+            selected_y = list(yy[idx])
+            crop_w = float(rw - ue_shift)
+        elif ue_shift_crops_types == "random":
+            selected_x = [float(rng.integers(0, ue_shift))
+                          for _ in range(ue_num_crops - 1)]
+            selected_y = [float(rng.integers(0, ue_shift))
+                          for _ in range(ue_num_crops - 1)]
+            crop_w = float(rw - ue_shift)
+        else:
+            raise NotImplementedError(
+                f"Unknown ue_shift_crops_types: {ue_shift_crops_types}")
+
+        # Build bbox for each crop: first crop is the full image (unshifted)
+        x_start_list = [0.0] + selected_x
+        y_start_list = [0.0] + selected_y
+        w_list = [float(rw)] + [crop_w] * (ue_num_crops - 1)
+
+        # Replicate batch for all crops: [B*num_crops, C, H, W]
+        sat_rep = satellite_image.unsqueeze(1).repeat(1, ue_num_crops, 1, 1, 1).view(
+            B * ue_num_crops, C, H_sat, W_sat)
+        thermal_rep = thermal_image.unsqueeze(1).repeat(1, ue_num_crops, 1, 1, 1).view(
+            B * ue_num_crops, C, H_th, W_th)
+
+        # Generate crop bboxes and apply to thermal images
+        x_start = torch.tensor(x_start_list, dtype=torch.float32, device=device).repeat(B)
+        y_start = torch.tensor(y_start_list, dtype=torch.float32, device=device).repeat(B)
+        w = torch.tensor(w_list, dtype=torch.float32, device=device).repeat(B)
+        bbox_s = bbox_utils.bbox_generator(x_start, y_start, w, w)
+
+        # Compute H_CTtoT: transform from cropped coords back to original coords
+        bbox_s_swap = torch.stack(
+            [bbox_s[:, 0], bbox_s[:, 1], bbox_s[:, 3], bbox_s[:, 2]], dim=1)
+        four_point_org = self._get_four_point_org(rw, device).repeat(
+            B * ue_num_crops, 1, 1, 1)
+        four_point_org_flat = four_point_org.view(
+            B * ue_num_crops, 2, 4).permute(0, 2, 1).contiguous()
+        H_CTtoT = tgm.get_perspective_transform(bbox_s_swap, four_point_org_flat)
+
+        # Crop thermal images
+        thermal_cropped = tgm.crop_and_resize(thermal_rep, bbox_s, (rw, rw))
+
+        # Run full two-stage forward on all crops
+        image_1 = F.interpolate(sat_rep, size=rw,
+                                mode='bilinear', align_corners=True, antialias=True)
+
+        _, four_pred_coarse = self.netG(
+            image1=image_1, image2=thermal_cropped,
+            iters_lev0=self.iters_lev0, corr_level=self.corr_level)
+        
+        print(four_pred_coarse)
+
+        image_1_crop, delta, flow_bbox = self._crop_for_refinement(
+            sat_rep, four_pred_coarse)
+        _, four_pred_fine = self.netG_fine(
+            image1=image_1_crop, image2=thermal_cropped,
+            iters_lev0=self.iters_lev1)
+        all_preds = self._combine_coarse_fine(four_pred_fine, delta, flow_bbox)
+
+        # Recover predictions from cropped coords back to original coords
+        four_point_org_single = self._get_four_point_org(rw, device)
+        recovered_preds = []
+        for i in range(B * ue_num_crops):
+            pred_i = all_preds[i:i+1]  # [1, 2, 2, 2]
+            four_corners = pred_i + four_point_org_single  # absolute corners
+
+            # Transform through: crop coords -> original coords
+            # H_StoT maps from crop bbox to the original image
+            corners_flat = four_corners.view(1, 2, 4)  # [1, 2, 4]
+            corners_homo = torch.cat([corners_flat,
+                                       torch.ones(1, 1, 4, device=device)], dim=1)  # [1, 3, 4]
+
+            # Get the perspective transform from crop to thermal
+            H_StoT = tgm.get_perspective_transform(
+                bbox_s_swap[i:i+1],
+                four_corners.view(1, 2, 4).permute(0, 2, 1).contiguous())
+            H_StoT_inv = torch.linalg.inv(H_StoT)
+
+            transformed = H_StoT @ H_CTtoT[i:i+1] @ H_StoT_inv @ corners_homo
+            transformed = transformed[:, :2, :] / transformed[:, 2:, :]
+            recovered = transformed.view(1, 2, 2, 2) - four_point_org_single
+            recovered_preds.append(recovered)
+
+        recovered_preds = torch.cat(recovered_preds, dim=0)  # [B*num_crops, 2, 2, 2]
+
+        # Reshape to [B, num_crops, 2, 2, 2]
+        recovered_preds = recovered_preds.view(B, ue_num_crops, 2, 2, 2)
+
+        # Use the first (unshifted) crop as the final prediction
+        four_pred = recovered_preds[:, 0]  # [B, 2, 2, 2]
+
+        # Compute std across crops for uncertainty
+        std_pred = torch.std(recovered_preds, dim=1)  # [B, 2, 2, 2]
 
         return four_pred, std_pred
 
@@ -752,9 +892,9 @@ if __name__ == "__main__":
     print(f"Model loaded on {device}\n")
 
     # ---- Configuration ----
-    satellite_dir = 'js_datasets/Dehat/satellite'
-    thermal_dir = 'js_datasets/Dehat/thermal'
-    output_excel = 'js_excels/batch_results.xlsx'
+    satellite_dir = 'test/sat'
+    thermal_dir = 'test/th'
+    output_excel = 'test/batch_results.xlsx'
     num_samples = 108
     tiles_per_satellite = 9
 
@@ -784,21 +924,32 @@ if __name__ == "__main__":
             resource_monitor.sample()
             
             try:
+
+                # TODO database size 
                 if count != 0:
                     global_timing.start('data_loading')
-                satellite = load_and_preprocess_satellite(sat_path,model.resize_width).to(device)
-                thermal = load_and_preprocess_thermal(th_path, model.resize_width).to(device)
+                satellite = load_and_preprocess_satellite(sat_path,model.database_size).to(device)
+                thermal = load_and_preprocess_thermal(th_path,  model.resize_width).to(device)
                 if count != 0:
                     global_timing.end('data_loading')
-
+                test = False
                 # ---- Forward with uncertainty ----
-                four_pred, std_pred = model.forward_with_uncertainty(
-                    satellite, thermal,
-                    ue_num_crops=5, ue_shift=32,
-                    ue_shift_crops_types=model.ue_shift_crops_types,
-                    firststage_ue=True)
-                
-                
+                # four_pred, std_pred = model.forward_with_uncertainty(
+                #     satellite, thermal,
+                #     ue_num_crops=5, ue_shift=32,
+                #     ue_shift_crops_types=model.ue_shift_crops_types,
+                #     firststage_ue=True)
+                four_pred, std_pred = model.forward_with_uncertainty_org(
+                satellite, thermal, ue_num_crops=5, ue_shift=32,
+                ue_shift_crops_types="random")
+
+                # four_pred = model.forward(satellite, thermal)
+
+                # print()
+                # print(f"for {sat_idx}_{th_idx} we have {four_pred}")
+                # print()
+                # print(f"std: {std_pred}")
+
                 # ---- Extract results ----
                 four_point_org = torch.zeros((1, 2, 2, 2), device=device)
                 four_point_org[:, :, 0, 0] = torch.tensor([0, 0])
@@ -814,7 +965,7 @@ if __name__ == "__main__":
                     corners[0, 1, 1], corners[1, 1, 1],
                 ])
                 
-                uncertainty = std_pred[0].cpu().mean().item() * alpha
+                # uncertainty = std_pred[0].cpu().mean().item() * alpha
                 
                 results.append({
                     'image_index': count,
@@ -826,7 +977,7 @@ if __name__ == "__main__":
                     'x4': corners_flat[6], 'y4': corners_flat[7],
                     'sat': sat_path,
                     'th': th_path,
-                    'uncertainty': uncertainty,
+                    # 'uncertainty': uncertainty,
                 })
                 count += 1
                 

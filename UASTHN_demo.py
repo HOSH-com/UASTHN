@@ -277,6 +277,8 @@ class UASTHN(nn.Module, PyTorchModelHubMixin):
         _, four_pred_coarse = self.netG(
             image1=image_1, image2=thermal_cropped,
             iters_lev0=self.iters_lev0, corr_level=self.corr_level)
+        
+        print(four_pred_coarse)
 
         image_1_crop, delta, flow_bbox = self._crop_for_refinement(
             sat_rep, four_pred_coarse)
@@ -544,7 +546,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    save_path = 'examples/UASTHN_result.png'
+    save_path = 'examples/test2.png'
 
     # ---- Load Model from HuggingFace Hub ----
     repo_id = 'xjh19972/UASTHN'
@@ -559,15 +561,19 @@ if __name__ == "__main__":
     print(f"Running inference on {device} (normal thermal image)...")
     print(f"{'='*60}")
     satellite = load_and_preprocess_satellite(
-        'examples/img1.png', model.database_size).to(device)
+        'test/sat/5.tif', model.database_size).to(device)
     thermal = load_and_preprocess_thermal(
-        'examples/img2.png', model.resize_width).to(device)
+        'test/th/5_9.tif', model.resize_width).to(device)
 
     with torch.no_grad():
         print("Using CropTTA for uncertainty estimation (5 crops)...")
         four_pred, std_pred = model.forward_with_uncertainty(
             satellite, thermal, ue_num_crops=5, ue_shift=32,
-            ue_shift_crops_types="grid")
+            ue_shift_crops_types="random")
+        
+        print(f"we have {four_pred}")
+        print()
+        print(f"std: {std_pred}")
 
     visualize_result(satellite, thermal, four_pred,
                      model.resize_width, model.database_size,
@@ -575,35 +581,35 @@ if __name__ == "__main__":
                      std_pred=std_pred)
 
     # ---- Run Inference on fog image (out-of-distribution) ----
-    if os.path.exists('examples/fog.jpg'):
-        print(f"\n{'='*60}")
-        print(f"Running inference on {device} (fog image - OOD)...")
-        print(f"{'='*60}")
-        fog = load_and_preprocess_thermal(
-            'examples/fog.jpg', model.resize_width).to(device)
+    # if os.path.exists('examples/fog.jpg'):
+    #     print(f"\n{'='*60}")
+    #     print(f"Running inference on {device} (fog image - OOD)...")
+    #     print(f"{'='*60}")
+    #     fog = load_and_preprocess_thermal(
+    #         'examples/fog.jpg', model.resize_width).to(device)
 
-        with torch.no_grad():
-            print("Using CropTTA for uncertainty estimation (5 crops)...")
-            _, std_pred_fog = model.forward_with_uncertainty(
-                satellite, fog, ue_num_crops=5, ue_shift=32,
-                ue_shift_crops_types="grid")
+    #     with torch.no_grad():
+    #         print("Using CropTTA for uncertainty estimation (5 crops)...")
+    #         _, std_pred_fog = model.forward_with_uncertainty(
+    #             satellite, fog, ue_num_crops=5, ue_shift=32,
+    #             ue_shift_crops_types="grid")
 
-        alpha = model.database_size / model.resize_width
-        std_fog = std_pred_fog[0].cpu()
-        std_fog_scaled = std_fog * alpha
-        print(f"\nFog Uncertainty Std (pixels at {model.resize_width}x{model.resize_width} scale):")
-        print(f"  Top-Left:     sx={std_fog[0,0,0]:.2f}, sy={std_fog[1,0,0]:.2f}")
-        print(f"  Top-Right:    sx={std_fog[0,0,1]:.2f}, sy={std_fog[1,0,1]:.2f}")
-        print(f"  Bottom-Left:  sx={std_fog[0,1,0]:.2f}, sy={std_fog[1,1,0]:.2f}")
-        print(f"  Bottom-Right: sx={std_fog[0,1,1]:.2f}, sy={std_fog[1,1,1]:.2f}")
-        print(f"  Mean Std: {std_fog.mean():.2f} (at {model.resize_width}x{model.resize_width}), "
-              f"{std_fog_scaled.mean():.2f} (at {model.database_size}x{model.database_size})")
+    #     alpha = model.database_size / model.resize_width
+    #     std_fog = std_pred_fog[0].cpu()
+    #     std_fog_scaled = std_fog * alpha
+    #     print(f"\nFog Uncertainty Std (pixels at {model.resize_width}x{model.resize_width} scale):")
+    #     print(f"  Top-Left:     sx={std_fog[0,0,0]:.2f}, sy={std_fog[1,0,0]:.2f}")
+    #     print(f"  Top-Right:    sx={std_fog[0,0,1]:.2f}, sy={std_fog[1,0,1]:.2f}")
+    #     print(f"  Bottom-Left:  sx={std_fog[0,1,0]:.2f}, sy={std_fog[1,1,0]:.2f}")
+    #     print(f"  Bottom-Right: sx={std_fog[0,1,1]:.2f}, sy={std_fog[1,1,1]:.2f}")
+    #     print(f"  Mean Std: {std_fog.mean():.2f} (at {model.resize_width}x{model.resize_width}), "
+    #           f"{std_fog_scaled.mean():.2f} (at {model.database_size}x{model.database_size})")
 
-        # ---- Compare uncertainty ----
-        print(f"\n{'='*60}")
-        print("Uncertainty Comparison (Mean Std at resize_width scale):")
-        print(f"  Normal thermal: {std_pred[0].cpu().mean():.2f}")
-        print(f"  Fog (OOD):      {std_fog.mean():.2f}")
-        ratio = std_fog.mean() / std_pred[0].cpu().mean()
-        print(f"  Ratio (fog/normal): {ratio:.2f}x")
-        print(f"{'='*60}")
+    #     # ---- Compare uncertainty ----
+    #     print(f"\n{'='*60}")
+    #     print("Uncertainty Comparison (Mean Std at resize_width scale):")
+    #     print(f"  Normal thermal: {std_pred[0].cpu().mean():.2f}")
+    #     print(f"  Fog (OOD):      {std_fog.mean():.2f}")
+    #     ratio = std_fog.mean() / std_pred[0].cpu().mean()
+    #     print(f"  Ratio (fog/normal): {ratio:.2f}x")
+    #     print(f"{'='*60}")
