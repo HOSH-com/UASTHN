@@ -30,6 +30,7 @@ import traceback
 
 from model.js_network import UASTHN
 # from model.network import UASTHN
+from utils import ResourceMonitor
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -370,7 +371,6 @@ def _load_model_weights(model, args, logger):
     log_gpu_memory(logger, "After model loading")
     return model
 
-
 def _create_reference_points(args):
     """Create reference corner coordinates"""
     four_point_org_single = torch.zeros((1, 2, 2, 2), device=args.device)
@@ -479,6 +479,13 @@ def run_js_loop(cli_args):
     # Setup logging
     logger = setup_logging(cli_args.log_dir)
     
+    # Initialize ResourceMonitor
+    resource_monitor = ResourceMonitor()
+    
+    # Start overall monitoring
+    resource_monitor.start_monitoring()
+    resource_monitor.checkpoint("Start of script")
+
     # Print header
     colored_print("\n" + "=" * 70, Colors.CYAN, bold=True)
     colored_print("UASTHN INFERENCE WITH UNCERTAINTY ESTIMATION", Colors.CYAN, bold=True)
@@ -507,6 +514,8 @@ def run_js_loop(cli_args):
     # Build arguments
     logger.info("\nBuilding runtime arguments...")
     args = _build_runtime_args(cli_args)
+    
+    resource_monitor.checkpoint("Args building complete")
     
     # Log configuration
     logger.info("=" * 60)
@@ -550,7 +559,9 @@ def run_js_loop(cli_args):
     # Create UASTHN model
     logger.info("Creating UASTHN model...")
     try:
+        # Resource monitor will track model loading
         model = UASTHN(args)
+        resource_monitor.checkpoint("Model Creation")
         logger.info("Model created successfully")
     except Exception as e:
         logger.error(f"Failed to create model: {e}")
@@ -558,6 +569,10 @@ def run_js_loop(cli_args):
     
     # Load weights
     model = _load_model_weights(model, args, logger)
+    resource_monitor.checkpoint("Model Weights Loading")
+    
+    # Add resource monitor to model for later use
+    model.resource_monitor = resource_monitor
 
     # Setup transforms
     thermal_transform = transforms.Compose([
@@ -607,10 +622,9 @@ def run_js_loop(cli_args):
     if len(missing_files) > 0 and len(missing_files) <= 10:
         for f in missing_files:
             logger.warning(f"  Missing: {f}")
+    
+    resource_monitor.checkpoint("Pre-inference setup complete")
 
-    # ============================================================
-    # MAIN INFERENCE LOOP
-    # ============================================================
     # ============================================================
     # MAIN INFERENCE LOOP
     # ============================================================
@@ -626,6 +640,9 @@ def run_js_loop(cli_args):
     error_count = 0
     successful_count = 0
     
+    # Sample resource usage at start of inference
+    resource_monitor.sample()
+    
     loop_iter = range(cli_args.num_samples)
     
     if not cli_args.disable_tqdm:
@@ -633,8 +650,15 @@ def run_js_loop(cli_args):
     else:
         iterator = loop_iter
 
+    # Track inference start time for overall performance
+    inference_start_time = time.perf_counter()
+    
     with torch.inference_mode():
         for i in iterator:
+            # Sample resource usage periodically (every 10 images)
+            if i % 10 == 0 and i > 0:
+                resource_monitor.sample()
+            
             sat_idx = i // cli_args.tiles_per_satellite + 1   # satellite index (1-based)
             th_idx = i % cli_args.tiles_per_satellite + 1    # thermal tile index (1-based)
 
@@ -643,7 +667,6 @@ def run_js_loop(cli_args):
 
             if not os.path.exists(img1_path) or not os.path.exists(img2_path):
                 skipped_count += 1
-                # ADDED: sat_idx and th_idx in the skipped row
                 all_corners.append([i] + [np.nan]*8 + [img1_path, img2_path, sat_idx, th_idx, np.nan, 0])
                 continue
 
@@ -685,9 +708,11 @@ def run_js_loop(cli_args):
                     uncertainties.append(unc_value)
                     accepted_flags.append(is_accepted)
 
-                # Store results - WITH sat and th columns
+                # Store results
                 all_corners.append([
                     i,                    # 1. image_index
+                    sat_idx,             # 12. sat (fixed: use sat_idx instead of path)
+                    th_idx,              # 13. th (fixed: use th_idx instead of path)
                     flat_points[0],      # 2. x1
                     flat_points[1],      # 3. y1
                     flat_points[2],      # 4. x2
@@ -698,8 +723,6 @@ def run_js_loop(cli_args):
                     flat_points[7],      # 9. y4
                     img1_path,           # 10. satellite_path
                     img2_path,           # 11. thermal_path
-                    img1_path,           # 12. sat
-                    img2_path,           # 13. th
                     unc_value,           # 14. uncertainty
                     is_accepted          # 15. accepted
                 ])
@@ -716,19 +739,17 @@ def run_js_loop(cli_args):
                         f"Sat{sat_idx}_T{th_idx}"
                     )
 
-                # print(f"✅ Done image {i + 1}/{cli_args.num_samples} in {elapsed:.3f} sec")
             except Exception as e:
                 error_count += 1
                 if error_count <= 3:
                     logger.error(f"❌ Error image {i}: {e}")
                     traceback.print_exc()
-                # ADDED: sat_idx and th_idx in the error row
-                # For skip case (8 NaN for coordinates + img1_path + img2_path + img1_path + img2_path + NaN + 0)
-                all_corners.append([i] + [np.nan]*8 + [img1_path, img2_path, img1_path, img2_path, np.nan, 0])
+                all_corners.append([i] + [np.nan]*8 + [img1_path, img2_path, sat_idx, th_idx, np.nan, 0])
 
-                # For error case
-                all_corners.append([i] + [np.nan]*8 + [img1_path, img2_path, img1_path, img2_path, np.nan, 0])
-
+    # End inference time tracking
+    inference_end_time = time.perf_counter()
+    resource_monitor.checkpoint("Inference Loop Complete")
+    
     # ============================================================
     # PERFORMANCE SUMMARY
     # ============================================================
@@ -765,6 +786,27 @@ def run_js_loop(cli_args):
                 accepted_count = sum(accepted_flags)
                 logger.info(f"Accepted: {accepted_count}/{len(accepted_flags)} ({100*accepted_count/len(accepted_flags):.1f}%)")
 
+    # End overall monitoring
+    total_delta = resource_monitor.end_monitoring("Complete Pipeline")
+    
+    # Print resource monitoring summary
+    logger.info("\n" + "=" * 60)
+    logger.info("RESOURCE USAGE SUMMARY")
+    logger.info("=" * 60)
+    resource_monitor.summary()
+    
+    # Print resource deltas to logger
+    if resource_monitor.delta_history:
+        logger.info("\nResource Usage Deltas:")
+        for delta in resource_monitor.delta_history:
+            logger.info(f"  {delta['operation']}:")
+            if delta.get('ram_delta_gb') is not None:
+                logger.info(f"    RAM: +{delta['ram_delta_gb']:.2f} GB")
+            if delta.get('gpu_memory_delta_gb') is not None:
+                logger.info(f"    GPU Memory: +{delta['gpu_memory_delta_gb']:.2f} GB")
+            if delta.get('pytorch_allocated_delta_gb') is not None:
+                logger.info(f"    PyTorch Allocated: +{delta['pytorch_allocated_delta_gb']:.2f} GB")
+
     # ============================================================
     # SAVE RESULTS
     # ============================================================
@@ -772,7 +814,7 @@ def run_js_loop(cli_args):
     logger.info("SAVING RESULTS")
     logger.info("=" * 60)
     
-    # UPDATED: Added "sat" and "th" columns
+    # Updated columns with correct sat/th as integers
     columns = [
         "image_index",       # 1
         "x1", "y1",          # 2,3
@@ -781,8 +823,8 @@ def run_js_loop(cli_args):
         "x4", "y4",          # 8,9
         "satellite_path",    # 10
         "thermal_path",      # 11
-        "sat",               # 12
-        "th",                # 13
+        "sat",               # 12 (now integer)
+        "th",                # 13 (now integer)
         "uncertainty",       # 14
         "accepted",          # 15
     ]
@@ -797,7 +839,18 @@ def run_js_loop(cli_args):
     logger.info(f"Results: {output_excel}")
     logger.info(f"OK: {successful_count} | Skip: {skipped_count} | Err: {error_count}")
     if times:
-        logger.info(f"Avg: {avg_time:.3f}s/img ({fps:.2f} FPS)")
+        avg_time_calc = np.mean(times[cli_args.warmup_skip:] if len(times) > cli_args.warmup_skip else times)
+        fps_calc = 1.0 / avg_time_calc if avg_time_calc > 0 else 0.0
+        logger.info(f"Avg: {avg_time_calc:.3f}s/img ({fps_calc:.2f} FPS)")
+    
+    # Print timing summary (skipping first image)
+    model.global_timing.print_summary(len(df), warmup_images=1)
+    
+    # Print final resource summary again for visibility
+    colored_print("\n" + "=" * 70, Colors.CYAN, bold=True)
+    colored_print("FINAL RESOURCE USAGE", Colors.CYAN, bold=True)
+    colored_print("=" * 70, Colors.CYAN, bold=True)
+    resource_monitor.summary()
 
 def parse_cli_args():
     """Parse command line arguments with uncertainty estimation options"""
