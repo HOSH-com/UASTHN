@@ -109,19 +109,14 @@ def get_perspective_transform_torch(src, dst):
             
         
         # Solve using SVD
-        try:
-            U, S, Vh = torch.linalg.svd(A.cpu())
-            h = Vh[-1].to(device)
-            # U, S, Vh = torch.linalg.svd(A)
-            # h = Vh[-1, :]  # Last row of V (or last column of V^H)
-            H_b = h.reshape(3, 3)
-            
-            # Normalize so that H[2,2] = 1
-            H_b = H_b / H_b[2, 2]
+        U, S, Vh = torch.linalg.svd(A)
+        # U, S, Vh = torch.linalg.svd(A.cpu())
+        h = Vh[-1].to(device)
+        H_b = h.reshape(3, 3)
+        
+        # Normalize so that H[2,2] = 1
+        H_b = H_b / H_b[2, 2]
 
-        except:
-            # If SVD fails, return identity matrix
-            H_b = torch.eye(3, device=device, dtype=dtype)
         
         H_list.append(H_b)
     
