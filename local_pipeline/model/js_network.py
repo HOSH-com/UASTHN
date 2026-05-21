@@ -6,7 +6,7 @@ import kornia.geometry.bbox as bbox
 from update import GMA
 from extractor import BasicEncoderQuarter
 from corr import CorrBlock
-from utils import coords_grid, sequence_loss, single_loss, single_neg_loss, sequence_neg_loss, fetch_optimizer, warp
+from utils import coords_grid, sequence_loss, single_loss, single_neg_loss, sequence_neg_loss, fetch_optimizer, warp, TimingTracker
 import os
 import sys
 from model.sync_batchnorm import convert_model
@@ -27,10 +27,15 @@ from model.js_kornia_replacement import (
 autocast = torch.amp.autocast
 
 class IHN(nn.Module):
-    def __init__(self, args, first_stage, ue_method="none"):
+    def __init__(self, args, first_stage, ue_method="none", timer = None):
         super().__init__()
         # self.device = torch.device('cuda:' + str(args.gpuid[0]))
         self.device = torch.device(args.device)
+
+        if timer is None:
+            self.global_timing = TimingTracker()  
+        else:
+            self.global_timing = timer  
         self.args = args
         self.ue_method = ue_method
         self.hidden_dim = 128
@@ -58,8 +63,8 @@ class IHN(nn.Module):
         four_point_new = four_point_org + four_point
         four_point_org = four_point_org.flatten(2).permute(0, 2, 1).contiguous()
         four_point_new = four_point_new.flatten(2).permute(0, 2, 1).contiguous()
-        # H = tgm.get_perspective_transform(four_point_org, four_point_new)
-        H = get_perspective_transform_torch(four_point_org, four_point_new)
+        H = tgm.get_perspective_transform(four_point_org, four_point_new)
+        # H = get_perspective_transform_torch(four_point_org, four_point_new)
         gridy, gridx = torch.meshgrid(torch.linspace(0, self.args.resize_width//4-1, steps=self.args.resize_width//4), torch.linspace(0, self.args.resize_width//4-1, steps=self.args.resize_width//4))
         points = torch.cat((gridx.flatten().unsqueeze(0), gridy.flatten().unsqueeze(0), torch.ones((1, self.args.resize_width//4 * self.args.resize_width//4))),
                            dim=0).unsqueeze(0).repeat(H.shape[0], 1, 1).to(four_point.device)
@@ -113,6 +118,12 @@ class IHN(nn.Module):
     def forward(self, image1, image2, iters_lev0 = 6, iters_lev1=6, corr_level=2, corr_radius=4, early_stop=-1):
         # image1 = 2 * (image1 / 255.0) - 1.0
         # image2 = 2 * (image2 / 255.0) - 1.0
+        stage = ""
+        if self.first_stage:
+            stage = "First Stage"
+        else:
+            stage = "Second Stage"
+
         if self.imagenet_mean is None:
             self.imagenet_mean = torch.Tensor([0.485, 0.456, 0.406]).unsqueeze(0).unsqueeze(2).unsqueeze(3).to(image1.device)
             self.imagenet_std = torch.Tensor([0.229, 0.224, 0.225]).unsqueeze(0).unsqueeze(2).unsqueeze(3).to(image1.device)
@@ -122,6 +133,9 @@ class IHN(nn.Module):
         with autocast(device_type='cuda', enabled=self.args.mixed_precision):
             # fmap1_64, fmap1_128 = self.fnet1(image1)
             # fmap2_64, _ = self.fnet1(image2)
+
+            self.global_timing.start(f"IHN Feature extraction {stage}")
+
             if not self.args.fnet_cat:
                 fmap1_64 = self.fnet1(image1)
                 fmap2_64 = self.fnet1(image2)
@@ -134,14 +148,18 @@ class IHN(nn.Module):
 
         fmap1 = fmap1_64.float()
         fmap2 = fmap2_64.float()
+        self.global_timing.end(f"IHN Feature extraction {stage}")
 
+        self. global_timing.start(f"CorrBlock Initialazation {stage}")
         # print(fmap1.shape, fmap2.shape)
         corr_fn = CorrBlock(fmap1, fmap2, num_levels=corr_level, radius=corr_radius)
+        
         coords0, coords1 = self.initialize_flow_4(image1)
         if self.args.check_step != -1 and self.first_stage and self.ue_method == "augment":
             B, C, H, W = fmap1.shape
             corr_fn_early = CorrBlock(fmap1.view(B//self.args.ue_num_crops, self.args.ue_num_crops, C, H, W)[:, 0], fmap2.view(B//self.args.ue_num_crops, self.args.ue_num_crops, C, H, W)[:, 0], num_levels=corr_level, radius=corr_radius)
             coords0_early = coords0.view(coords0.shape[0]//self.args.ue_num_crops, self.args.ue_num_crops, coords0.shape[1], coords0.shape[2], coords0.shape[3])[:,0]
+        self. global_timing.end(f"CorrBlock Initialazation {stage}")
         # print(coords0.shape, coords1.shape)
         sz = fmap1_64.shape
         self.sz = sz
@@ -150,7 +168,13 @@ class IHN(nn.Module):
         if self.ue_method == "single" and self.first_stage:
             four_point_ues = []
         # time1 = time.time()
+
+        sum_corr = 0.0
+        sum_update = 0.0
+        sum_dlt = 0.0
+        # self.global_timing.start(f"for {stage}")
         for itr in range(iters_lev0):
+            start_time = time.perf_counter()
             if (self.first_stage and (self.args.check_step == -1 or itr <= self.args.check_step)) or not self.first_stage:
                 corr = corr_fn(coords1)
                 flow = coords1 - coords0
@@ -160,20 +184,26 @@ class IHN(nn.Module):
             else:
                 corr = corr_fn(coords1)
                 flow = coords1 - coords0
+            sum_corr += time.perf_counter() - start_time
             # print(corr.shape, flow.shape)
             with autocast(device_type='cuda', enabled=self.args.mixed_precision):
+                start_time = time.perf_counter()
                 if self.args.weight:
                     delta_four_point, weight = self.update_block_4(corr, flow)
                 else:
                     delta_four_point = self.update_block_4(corr, flow)
                     if self.ue_method == "single" and self.first_stage:
                         ue_four_point = torch.clamp(self.ue_update_block_4(corr, flow), min=self.args.si_min)
-                    
+                sum_update += time.perf_counter() - start_time
+
             try:
+                start_time = time.perf_counter()
                 last_four_point_disp = four_point_disp
                 four_point_disp =  four_point_disp + delta_four_point
                 coords1 = self.get_flow_now_4(four_point_disp) # Possible error: Unsolvable H
                 four_point_predictions.append(four_point_disp)
+                sum_dlt += time.perf_counter() - start_time
+
                 if self.ue_method == "single" and self.first_stage:
                     four_point_ues.append(ue_four_point)
                 if itr == self.args.check_step and self.first_stage and self.ue_method == "augment":
@@ -195,8 +225,12 @@ class IHN(nn.Module):
             
             if early_stop!=-1 and itr==early_stop:
                 break
+        # self.global_timing.end(f"for {stage}")
         # time2 = time.time()
         # print("Time for iterative: " + str(time2 - time1) + " seconds") # 0.12
+        self.global_timing.add_time(f'Corr {stage}', sum_corr)
+        self.global_timing.add_time(f'Update {stage}', sum_update)
+        self.global_timing.add_time(f'DLT {stage}', sum_dlt)
 
         if self.ue_method == "single" and self.first_stage:
             return four_point_predictions, four_point_disp, four_point_ues
@@ -211,6 +245,7 @@ class UASTHN():
     def __init__(self, args, for_training=False):
         super().__init__()
         self.args = args
+        self.global_timing = TimingTracker()
         self.ue_method = args.ue_method
         self.device = args.device
         self.four_point_org_single = torch.zeros((1, 2, 2, 2)).to(self.device)
@@ -231,12 +266,12 @@ class UASTHN():
                 self.ensemble_model_names.append(self.ensemble_model_names_raw[i].strip())
             self.netG_list = [arch_list[args.arch](args, True, self.ue_method) for i in range(self.args.ue_num_crops)]
         else:
-            self.netG = arch_list[args.arch](args, True, self.ue_method)
+            self.netG = arch_list[args.arch](args, True, self.ue_method, timer=self.global_timing)
         self.shift_flow_bbox = None
         if args.two_stages:
             corr_level = args.corr_level
             args.corr_level = 2
-            self.netG_fine = IHN(args, False)
+            self.netG_fine = IHN(args, False, timer=self.global_timing)
             args.corr_level = corr_level
             if args.restore_ckpt is not None and not args.finetune:
                 self.set_requires_grad(self.netG, False)
@@ -440,8 +475,8 @@ class UASTHN():
         y_start = crop_top_left[:, 1] # B
         bbox_s = bbox.bbox_generator(x_start, y_start, w_padded, w_padded)
         delta = (w_padded / self.args.resize_width).unsqueeze(1).unsqueeze(1).unsqueeze(1)
-        # image_1_crop = tgm.crop_and_resize(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width)) # It will be padded when it is out of boundary
-        image_1_crop = crop_and_resize_torch(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width)) # It will be padded when it is out of boundary
+        image_1_crop = tgm.crop_and_resize(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width)) # It will be padded when it is out of boundary
+        # image_1_crop = crop_and_resize_torch(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width)) # It will be padded when it is out of boundary
         # swap bbox_s
         bbox_s_swap = torch.stack([bbox_s[:, 0], bbox_s[:, 1], bbox_s[:, 3], bbox_s[:, 2]], dim=1)
         four_cor_bbox = bbox_s_swap.permute(0, 2, 1). view(-1, 2, 2, 2)
@@ -467,8 +502,8 @@ class UASTHN():
             self.image_2 = self.image_2.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
             if self.args.ue_aug_method == "shift":
                 bbox_s = self.first_stage_ue_generate_bbox()
-                # self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
-                self.image_2 = crop_and_resize_torch(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
+                self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
+                # self.image_2 = crop_and_resize_torch(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
             elif self.args.ue_aug_method == "mask":
                 self.image_2 = self.image_2.view(B, self.args.ue_num_crops, C, H, W)
                 mask = torch.rand((self.image_2.shape[0], int(self.args.ue_num_crops - 1), 1, self.image_2.shape[3]//self.args.ue_mask_patchsize, self.image_2.shape[4]//self.args.ue_mask_patchsize)).to(self.image_2.device) > self.args.ue_mask_prob
@@ -480,8 +515,8 @@ class UASTHN():
             self.image_2 = self.image_2.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
             if self.args.ue_aug_method == "shift":
                 bbox_s = self.first_stage_ue_generate_bbox()
-                # self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
-                self.image_2 = crop_and_resize_torch(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
+                self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
+                # self.image_2 = crop_and_resize_torch(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
             elif self.args.ue_aug_method == "mask":
                 self.image_2 = self.image_2.view(B, self.args.ue_num_crops, C, H, W)
                 mask = torch.rand((self.image_2.shape[0], int(self.args.ue_num_crops - 1), 1, self.image_2.shape[3]//self.args.ue_mask_patchsize, self.image_2.shape[4]//self.args.ue_mask_patchsize)).to(self.image_2.device) > self.args.ue_mask_prob
@@ -545,8 +580,8 @@ class UASTHN():
         bbox_s = bbox.bbox_generator(x_start, y_start, w, w)
         bbox_s_swap = torch.stack([bbox_s[:, 0], bbox_s[:, 1], bbox_s[:, 3], bbox_s[:, 2]], dim=1)
         self.xct_before = bbox_s_swap
-        # self.H_CTtoT = tgm.get_perspective_transform(bbox_s_swap, self.four_point_org_single.repeat(bbox_s_swap.shape[0],1,1,1).view(bbox_s_swap.shape[0], 2, 4).permute(0, 2, 1).contiguous())
-        self.H_CTtoT = get_perspective_transform_torch(bbox_s_swap, self.four_point_org_single.repeat(bbox_s_swap.shape[0],1,1,1).view(bbox_s_swap.shape[0], 2, 4).permute(0, 2, 1).contiguous())
+        self.H_CTtoT = tgm.get_perspective_transform(bbox_s_swap, self.four_point_org_single.repeat(bbox_s_swap.shape[0],1,1,1).view(bbox_s_swap.shape[0], 2, 4).permute(0, 2, 1).contiguous())
+        # self.H_CTtoT = get_perspective_transform_torch(bbox_s_swap, self.four_point_org_single.repeat(bbox_s_swap.shape[0],1,1,1).view(bbox_s_swap.shape[0], 2, 4).permute(0, 2, 1).contiguous())
         return bbox_s
 
     def ue_aggregation(self, four_preds_list, alpha, for_training, check_step=-1):
@@ -562,12 +597,12 @@ class UASTHN():
                 for i in range(agg_step):
                     four_point_org_single_repeat = self.four_point_org_single.repeat(four_preds_list[i].shape[0],1,1,1)
                     four_corners = four_preds_list[i] + four_point_org_single_repeat # B x 2 x 2 x 2
-                    # H_StoT = tgm.get_perspective_transform(self.xct_before, four_corners.view(-1, 2, 4).permute(0, 2, 1).contiguous())
-                    H_StoT = get_perspective_transform_torch(self.xct_before, four_corners.view(-1, 2, 4).permute(0, 2, 1).contiguous())
-                    H_StoT_inv = torch.linalg.inv(H_StoT.cpu())
+                    H_StoT = tgm.get_perspective_transform(self.xct_before, four_corners.view(-1, 2, 4).permute(0, 2, 1).contiguous())
+                    # H_StoT = get_perspective_transform_torch(self.xct_before, four_corners.view(-1, 2, 4).permute(0, 2, 1).contiguous())
+                    H_StoT_inv = torch.linalg.inv(H_StoT)
                     four_corners_aug = torch.cat([four_corners.view(four_corners.shape[0], 2, 4),
                                                   torch.ones((four_corners.shape[0], 1, 4)).to(four_corners.device)], dim=1) # B x 3 x 4
-                    four_corners = torch.bmm(H_StoT, torch.bmm(self.H_CTtoT, torch.bmm(H_StoT_inv.cuda(), four_corners_aug))) # B x 3 x 4
+                    four_corners = torch.bmm(H_StoT, torch.bmm(self.H_CTtoT, torch.bmm(H_StoT_inv, four_corners_aug))) # B x 3 x 4
                     four_corners = four_corners[:,:2,:] / four_corners[:,2:,:] # B x 2 x 4
                     four_preds_recovered_single = four_corners.view(four_corners.shape[0], 2, 2, 2) - four_point_org_single_repeat
                     four_preds_recovered_list.append(four_preds_recovered_single)

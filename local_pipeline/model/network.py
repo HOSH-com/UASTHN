@@ -56,8 +56,8 @@ class IHN(nn.Module):
         four_point_new = four_point_org + four_point
         four_point_org = four_point_org.flatten(2).permute(0, 2, 1).contiguous()
         four_point_new = four_point_new.flatten(2).permute(0, 2, 1).contiguous()
-        H = get_perspective_transform_torch(four_point_org, four_point_new)
-        # H = tgm.get_perspective_transform(four_point_org, four_point_new)
+        # H = get_perspective_transform_torch(four_point_org, four_point_new)
+        H = tgm.get_perspective_transform(four_point_org, four_point_new)
         gridy, gridx = torch.meshgrid(torch.linspace(0, self.args.resize_width//4-1, steps=self.args.resize_width//4), torch.linspace(0, self.args.resize_width//4-1, steps=self.args.resize_width//4))
         points = torch.cat((gridx.flatten().unsqueeze(0), gridy.flatten().unsqueeze(0), torch.ones((1, self.args.resize_width//4 * self.args.resize_width//4))),
                            dim=0).unsqueeze(0).repeat(H.shape[0], 1, 1).to(four_point.device)
@@ -417,8 +417,8 @@ class UASTHN():
         y_start = crop_top_left[:, 1] # B
         bbox_s = bbox.bbox_generator(x_start, y_start, w_padded, w_padded)
         delta = (w_padded / self.args.resize_width).unsqueeze(1).unsqueeze(1).unsqueeze(1)
-        image_1_crop = crop_and_resize_torch(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width)) # It will be padded when it is out of boundary
-        # image_1_crop = tgm.crop_and_resize(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width)) # It will be padded when it is out of boundary
+        # image_1_crop = crop_and_resize_torch(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width)) # It will be padded when it is out of boundary
+        image_1_crop = tgm.crop_and_resize(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width)) # It will be padded when it is out of boundary
         # swap bbox_s
         bbox_s_swap = torch.stack([bbox_s[:, 0], bbox_s[:, 1], bbox_s[:, 3], bbox_s[:, 2]], dim=1)
         four_cor_bbox = bbox_s_swap.permute(0, 2, 1). view(-1, 2, 2, 2)
@@ -444,8 +444,8 @@ class UASTHN():
             self.image_2 = self.image_2.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
             if self.args.ue_aug_method == "shift":
                 bbox_s = self.first_stage_ue_generate_bbox()
-                self.image_2 = crop_and_resize_torch(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
-                # self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
+                # self.image_2 = crop_and_resize_torch(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
+                self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
             elif self.args.ue_aug_method == "mask":
                 self.image_2 = self.image_2.view(B, self.args.ue_num_crops, C, H, W)
                 mask = torch.rand((self.image_2.shape[0], int(self.args.ue_num_crops - 1), 1, self.image_2.shape[3]//self.args.ue_mask_patchsize, self.image_2.shape[4]//self.args.ue_mask_patchsize)).to(self.image_2.device) > self.args.ue_mask_prob
@@ -457,8 +457,8 @@ class UASTHN():
             self.image_2 = self.image_2.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
             if self.args.ue_aug_method == "shift":
                 bbox_s = self.first_stage_ue_generate_bbox()
-                self.image_2 = crop_and_resize_torch(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
-                # self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
+                # self.image_2 = crop_and_resize_torch(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
+                self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
             elif self.args.ue_aug_method == "mask":
                 self.image_2 = self.image_2.view(B, self.args.ue_num_crops, C, H, W)
                 mask = torch.rand((self.image_2.shape[0], int(self.args.ue_num_crops - 1), 1, self.image_2.shape[3]//self.args.ue_mask_patchsize, self.image_2.shape[4]//self.args.ue_mask_patchsize)).to(self.image_2.device) > self.args.ue_mask_prob
@@ -522,8 +522,8 @@ class UASTHN():
         bbox_s = bbox.bbox_generator(x_start, y_start, w, w)
         bbox_s_swap = torch.stack([bbox_s[:, 0], bbox_s[:, 1], bbox_s[:, 3], bbox_s[:, 2]], dim=1)
         self.xct_before = bbox_s_swap
-        self.H_CTtoT = get_perspective_transform_torch(bbox_s_swap, self.four_point_org_single.repeat(bbox_s_swap.shape[0],1,1,1).view(bbox_s_swap.shape[0], 2, 4).permute(0, 2, 1).contiguous())
-        # self.H_CTtoT = tgm.get_perspective_transform(bbox_s_swap, self.four_point_org_single.repeat(bbox_s_swap.shape[0],1,1,1).view(bbox_s_swap.shape[0], 2, 4).permute(0, 2, 1).contiguous())
+        # self.H_CTtoT = get_perspective_transform_torch(bbox_s_swap, self.four_point_org_single.repeat(bbox_s_swap.shape[0],1,1,1).view(bbox_s_swap.shape[0], 2, 4).permute(0, 2, 1).contiguous())
+        self.H_CTtoT = tgm.get_perspective_transform(bbox_s_swap, self.four_point_org_single.repeat(bbox_s_swap.shape[0],1,1,1).view(bbox_s_swap.shape[0], 2, 4).permute(0, 2, 1).contiguous())
         return bbox_s
 
     def ue_aggregation(self, four_preds_list, alpha, for_training, check_step=-1):
@@ -538,8 +538,8 @@ class UASTHN():
                 for i in range(agg_step):
                     four_point_org_single_repeat = self.four_point_org_single.repeat(four_preds_list[i].shape[0],1,1,1)
                     four_corners = four_preds_list[i] + four_point_org_single_repeat # B x 2 x 2 x 2
-                    H_StoT = get_perspective_transform_torch(self.xct_before, four_corners.view(-1, 2, 4).permute(0, 2, 1).contiguous())
-                    # H_StoT = tgm.get_perspective_transform(self.xct_before, four_corners.view(-1, 2, 4).permute(0, 2, 1).contiguous())
+                    # H_StoT = get_perspective_transform_torch(self.xct_before, four_corners.view(-1, 2, 4).permute(0, 2, 1).contiguous())
+                    H_StoT = tgm.get_perspective_transform(self.xct_before, four_corners.view(-1, 2, 4).permute(0, 2, 1).contiguous())
                     H_StoT_inv = torch.linalg.inv(H_StoT)
                     four_corners_aug = torch.cat([four_corners.view(four_corners.shape[0], 2, 4),
                                                   torch.ones((four_corners.shape[0], 1, 4)).to(four_corners.device)], dim=1) # B x 3 x 4
