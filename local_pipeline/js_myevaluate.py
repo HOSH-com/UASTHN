@@ -671,6 +671,7 @@ def run_js_loop(cli_args):
                 continue
 
             try:
+                start_time = time.perf_counter()
                 # Load images
                 model.global_timing.start('Load Images')
                 img1 = TF.to_tensor(Image.open(img1_path).convert("RGB")).unsqueeze(0)
@@ -682,7 +683,6 @@ def run_js_loop(cli_args):
                 if args.device.type == "cuda":
                     torch.cuda.synchronize(args.device)
 
-                start_time = time.perf_counter()
                 # Use _predict_four_points which has the monkey-patch fix for netG
                 four_pred, uncertainty, ue_mask = _predict_four_points(model, img1, img2, args) # TODO define consts outside for
 
@@ -819,17 +819,17 @@ def run_js_loop(cli_args):
     
     # Updated columns with correct sat/th as integers
     columns = [
-        "image_index",       # 1
+        "img_idx",       # 1
+        "sat_idx",          # 10
+        "th_idx",            # 11
         "x1", "y1",          # 2,3
         "x2", "y2",          # 4,5
         "x3", "y3",          # 6,7
         "x4", "y4",          # 8,9
-        "satellite_path",    # 10
-        "thermal_path",      # 11
         "sat",               # 12 (now integer)
         "th",                # 13 (now integer)
-        "uncertainty",       # 14
-        "accepted",          # 15
+        "ue",                  # 14
+        "acc",          # 15
     ]
     
     df = pd.DataFrame(all_corners, columns=columns)
