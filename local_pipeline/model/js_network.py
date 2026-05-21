@@ -6,7 +6,7 @@ import kornia.geometry.bbox as bbox
 from update import GMA
 from extractor import BasicEncoderQuarter
 from corr import CorrBlock
-from utils import coords_grid, sequence_loss, single_loss, single_neg_loss, sequence_neg_loss, fetch_optimizer, warp
+from utils import coords_grid, sequence_loss, single_loss, single_neg_loss, sequence_neg_loss, fetch_optimizer, warp, TimingTracker
 import os
 import sys
 from model.sync_batchnorm import convert_model
@@ -27,10 +27,15 @@ from model.js_kornia_replacement import (
 autocast = torch.amp.autocast
 
 class IHN(nn.Module):
-    def __init__(self, args, first_stage, ue_method="none"):
+    def __init__(self, args, first_stage, ue_method="none", timer = None):
         super().__init__()
         # self.device = torch.device('cuda:' + str(args.gpuid[0]))
         self.device = torch.device(args.device)
+
+        if timer is None:
+            self.global_timing = TimingTracker()  
+        else:
+            self.global_timing = timer  
         self.args = args
         self.ue_method = ue_method
         self.hidden_dim = 128
@@ -113,6 +118,12 @@ class IHN(nn.Module):
     def forward(self, image1, image2, iters_lev0 = 6, iters_lev1=6, corr_level=2, corr_radius=4, early_stop=-1):
         # image1 = 2 * (image1 / 255.0) - 1.0
         # image2 = 2 * (image2 / 255.0) - 1.0
+        stage = ""
+        if self.first_stage:
+            stage = "First Stage"
+        else:
+            stage = "Second Stage"
+
         if self.imagenet_mean is None:
             self.imagenet_mean = torch.Tensor([0.485, 0.456, 0.406]).unsqueeze(0).unsqueeze(2).unsqueeze(3).to(image1.device)
             self.imagenet_std = torch.Tensor([0.229, 0.224, 0.225]).unsqueeze(0).unsqueeze(2).unsqueeze(3).to(image1.device)
@@ -122,6 +133,9 @@ class IHN(nn.Module):
         with autocast(device_type='cuda', enabled=self.args.mixed_precision):
             # fmap1_64, fmap1_128 = self.fnet1(image1)
             # fmap2_64, _ = self.fnet1(image2)
+
+            self.global_timing.start(f"IHN Feature extraction {stage}")
+
             if not self.args.fnet_cat:
                 fmap1_64 = self.fnet1(image1)
                 fmap2_64 = self.fnet1(image2)
@@ -134,14 +148,18 @@ class IHN(nn.Module):
 
         fmap1 = fmap1_64.float()
         fmap2 = fmap2_64.float()
+        self.global_timing.end(f"IHN Feature extraction {stage}")
 
+        self. global_timing.start(f"CorrBlock Initialazation {stage}")
         # print(fmap1.shape, fmap2.shape)
         corr_fn = CorrBlock(fmap1, fmap2, num_levels=corr_level, radius=corr_radius)
+        
         coords0, coords1 = self.initialize_flow_4(image1)
         if self.args.check_step != -1 and self.first_stage and self.ue_method == "augment":
             B, C, H, W = fmap1.shape
             corr_fn_early = CorrBlock(fmap1.view(B//self.args.ue_num_crops, self.args.ue_num_crops, C, H, W)[:, 0], fmap2.view(B//self.args.ue_num_crops, self.args.ue_num_crops, C, H, W)[:, 0], num_levels=corr_level, radius=corr_radius)
             coords0_early = coords0.view(coords0.shape[0]//self.args.ue_num_crops, self.args.ue_num_crops, coords0.shape[1], coords0.shape[2], coords0.shape[3])[:,0]
+        self. global_timing.end(f"CorrBlock Initialazation {stage}")
         # print(coords0.shape, coords1.shape)
         sz = fmap1_64.shape
         self.sz = sz
@@ -150,7 +168,12 @@ class IHN(nn.Module):
         if self.ue_method == "single" and self.first_stage:
             four_point_ues = []
         # time1 = time.time()
+
+        sum_corr = 0.0
+        sum_update = 0.0
+        self.global_timing.start(f"for {stage}")
         for itr in range(iters_lev0):
+            start_time = time.perf_counter()
             if (self.first_stage and (self.args.check_step == -1 or itr <= self.args.check_step)) or not self.first_stage:
                 corr = corr_fn(coords1)
                 flow = coords1 - coords0
@@ -160,15 +183,18 @@ class IHN(nn.Module):
             else:
                 corr = corr_fn(coords1)
                 flow = coords1 - coords0
+            sum_corr += time.perf_counter() - start_time
             # print(corr.shape, flow.shape)
             with autocast(device_type='cuda', enabled=self.args.mixed_precision):
+                start_time = time.perf_counter()
                 if self.args.weight:
                     delta_four_point, weight = self.update_block_4(corr, flow)
                 else:
                     delta_four_point = self.update_block_4(corr, flow)
                     if self.ue_method == "single" and self.first_stage:
                         ue_four_point = torch.clamp(self.ue_update_block_4(corr, flow), min=self.args.si_min)
-                    
+                sum_update += time.perf_counter() - start_time
+
             try:
                 last_four_point_disp = four_point_disp
                 four_point_disp =  four_point_disp + delta_four_point
@@ -195,8 +221,11 @@ class IHN(nn.Module):
             
             if early_stop!=-1 and itr==early_stop:
                 break
+        self.global_timing.end(f"for {stage}")
         # time2 = time.time()
         # print("Time for iterative: " + str(time2 - time1) + " seconds") # 0.12
+        self.global_timing.add_time(f'Corr {stage}', sum_corr)
+        self.global_timing.add_time(f'Update {stage}', sum_update)
 
         if self.ue_method == "single" and self.first_stage:
             return four_point_predictions, four_point_disp, four_point_ues
@@ -211,6 +240,7 @@ class UASTHN():
     def __init__(self, args, for_training=False):
         super().__init__()
         self.args = args
+        self.global_timing = TimingTracker()
         self.ue_method = args.ue_method
         self.device = args.device
         self.four_point_org_single = torch.zeros((1, 2, 2, 2)).to(self.device)
@@ -231,12 +261,12 @@ class UASTHN():
                 self.ensemble_model_names.append(self.ensemble_model_names_raw[i].strip())
             self.netG_list = [arch_list[args.arch](args, True, self.ue_method) for i in range(self.args.ue_num_crops)]
         else:
-            self.netG = arch_list[args.arch](args, True, self.ue_method)
+            self.netG = arch_list[args.arch](args, True, self.ue_method, timer=self.global_timing)
         self.shift_flow_bbox = None
         if args.two_stages:
             corr_level = args.corr_level
             args.corr_level = 2
-            self.netG_fine = IHN(args, False)
+            self.netG_fine = IHN(args, False, timer=self.global_timing)
             args.corr_level = corr_level
             if args.restore_ckpt is not None and not args.finetune:
                 self.set_requires_grad(self.netG, False)
