@@ -212,7 +212,7 @@ def _build_runtime_args(cli_args):
     ]
     
     # Two-stage settings
-    args.two_stages = True
+    args.two_stages = cli_args.two_stages
     
     # ============================================================
     # UNCERTAINTY ESTIMATION SETTINGS
@@ -568,7 +568,7 @@ def run_js_loop(cli_args):
         raise
     
     # Load weights
-    model = _load_model_weights(model, args, logger)
+    model: UASTHN = _load_model_weights(model, args, logger)
     resource_monitor.checkpoint("Model Weights Loading")
     
     # Add resource monitor to model for later use
@@ -672,16 +672,19 @@ def run_js_loop(cli_args):
 
             try:
                 # Load images
+                model.global_timing.start('Load Images')
                 img1 = TF.to_tensor(Image.open(img1_path).convert("RGB")).unsqueeze(0)
                 img2 = thermal_transform(Image.open(img2_path)).unsqueeze(0)
+                model.global_timing.end('Load Images')
+
 
                 # Time the inference
                 if args.device.type == "cuda":
                     torch.cuda.synchronize(args.device)
-                start_time = time.perf_counter()
 
+                start_time = time.perf_counter()
                 # Use _predict_four_points which has the monkey-patch fix for netG
-                four_pred, uncertainty, ue_mask = _predict_four_points(model, img1, img2, args)
+                four_pred, uncertainty, ue_mask = _predict_four_points(model, img1, img2, args) # TODO define consts outside for
 
                 if args.device.type == "cuda":
                     torch.cuda.synchronize(args.device)
@@ -891,6 +894,8 @@ Examples:
                        help="Correlation pyramid levels")
     parser.add_argument("--fine_padding", type=int, default=32, 
                        help="Fine stage padding (32px from paper)")
+    parser.add_argument("--two_stages", action="store_true", 
+                       help="Set on Two Stages Mode")
 
     # Input/Output paths
     parser.add_argument("--satellite_dir", type=str, default="js_datasets/Dehat/satellite", 
