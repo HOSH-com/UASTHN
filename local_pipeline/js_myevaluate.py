@@ -381,68 +381,170 @@ def _create_reference_points(args):
     return four_point_org_single
 
 
-def _predict_four_points(model, img1, img2, args):
-    """
-    Predict 4-corner displacement.
-    Handles models that return variable number of values from netG.
-    """
-    img1 = img1.to(args.device)
-    img2 = img2.to(args.device)
+def _sync(device):
+    """GPU sync helper for accurate timing."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
+
+def _predict_four_points(model, img1, img2, args, profiler=None):
+    """
+    Predict 4-corner displacement with per-stage timing.
+    Handles models that return variable number of values from netG.
+
+    Returns
+    -------
+    four_pred   : tensor
+    uncertainty : tensor or None
+    ue_mask     : tensor or None
+    stage_times : dict  {stage_name: seconds}
+    """
+    stage_times = {}
+
+    # ------------------------------------------------------------------
+    # STAGE 1 – host→device transfer
+    # ------------------------------------------------------------------
+    _sync(args.device)
+    t0 = time.perf_counter()
+    img1 = img1.to(args.device, non_blocking=True)
+    img2 = img2.to(args.device, non_blocking=True)
     dummy_flow = torch.zeros(
-        (img1.shape[0], 2, args.resize_width, args.resize_width), 
+        (img1.shape[0], 2, args.resize_width, args.resize_width),
         device=args.device
     )
+    _sync(args.device)
+    stage_times["1_transfer_ms"] = (time.perf_counter() - t0) * 1000
 
+    # ------------------------------------------------------------------
+    # STAGE 2 – set_input  (interpolates satellite to resize_width)
+    # ------------------------------------------------------------------
+    _sync(args.device)
+    t0 = time.perf_counter()
     model.set_input(img1, img2, dummy_flow)
-    
+    _sync(args.device)
+    stage_times["2_set_input_ms"] = (time.perf_counter() - t0) * 1000
+
+    # ------------------------------------------------------------------
     # Monkey-patch netG to handle variable return values
-    # This fixes: "ValueError: too many values to unpack (expected 2)"
+    # ------------------------------------------------------------------
     original_netG = model.netG
-    
+
     def wrapped_netG(**kwargs):
         result = original_netG(**kwargs)
         if isinstance(result, tuple):
             if len(result) >= 2:
-                # Take first two values (four_preds_list, four_pred)
                 return result[0], result[1]
             elif len(result) == 1:
                 return [], result[0]
         return [], result
-    
-    # Temporarily replace netG
+
     model.netG = wrapped_netG
-    
+
+    # ------------------------------------------------------------------
+    # STAGE 3 – full forward pass  (UE crop gen + coarse + fine)
+    # We break this into sub-stages by monkey-patching the model methods.
+    # ------------------------------------------------------------------
+    sub = {}
+
+    # --- 3a: UE crop generation ---
+    orig_ue_gen = model.first_stage_ue_generate if hasattr(model, 'first_stage_ue_generate') else None
+    if orig_ue_gen is not None:
+        def timed_ue_gen(*a, **kw):
+            _sync(args.device)
+            t = time.perf_counter()
+            orig_ue_gen(*a, **kw)
+            _sync(args.device)
+            sub["3a_ue_generate_ms"] = (time.perf_counter() - t) * 1000
+        model.first_stage_ue_generate = timed_ue_gen
+
+    # --- 3b: coarse netG (IHN) ---
+    def timed_netG(**kwargs):
+        _sync(args.device)
+        t = time.perf_counter()
+        result = wrapped_netG(**kwargs)
+        _sync(args.device)
+        sub["3b_coarse_netG_ms"] = (time.perf_counter() - t) * 1000
+        return result
+    model.netG = timed_netG
+
+    # --- 3c: crop extraction for fine stage ---
+    orig_crop = model.get_cropped_st_images if hasattr(model, 'get_cropped_st_images') else None
+    if orig_crop is not None:
+        def timed_crop(*a, **kw):
+            _sync(args.device)
+            t = time.perf_counter()
+            result = orig_crop(*a, **kw)
+            _sync(args.device)
+            sub["3c_crop_extract_ms"] = (time.perf_counter() - t) * 1000
+            return result
+        model.get_cropped_st_images = timed_crop
+
+    # --- 3d: fine netG_fine ---
+    orig_fine = model.netG_fine if hasattr(model, 'netG_fine') else None
+    if orig_fine is not None:
+        def timed_fine(**kwargs):
+            _sync(args.device)
+            t = time.perf_counter()
+            result = orig_fine(**kwargs)
+            _sync(args.device)
+            sub["3d_fine_netG_ms"] = (time.perf_counter() - t) * 1000
+            return result
+        model.netG_fine = timed_fine
+
+    # --- 3e: UE aggregation ---
+    orig_ue_agg = model.first_stage_ue_aggregation if hasattr(model, 'first_stage_ue_aggregation') else None
+    if orig_ue_agg is not None:
+        def timed_ue_agg(*a, **kw):
+            _sync(args.device)
+            t = time.perf_counter()
+            result = orig_ue_agg(*a, **kw)
+            _sync(args.device)
+            sub["3e_ue_aggregation_ms"] = (time.perf_counter() - t) * 1000
+            return result
+        model.first_stage_ue_aggregation = timed_ue_agg
+
     try:
+        _sync(args.device)
+        t0 = time.perf_counter()
         model.forward(for_test=True)
+        _sync(args.device)
+        stage_times["3_forward_total_ms"] = (time.perf_counter() - t0) * 1000
+        stage_times.update(sub)
     finally:
-        # Restore original netG
+        # Restore everything
         model.netG = original_netG
-    
+        if orig_ue_gen is not None:
+            model.first_stage_ue_generate = orig_ue_gen
+        if orig_crop is not None:
+            model.get_cropped_st_images = orig_crop
+        if orig_fine is not None:
+            model.netG_fine = orig_fine
+        if orig_ue_agg is not None:
+            model.first_stage_ue_aggregation = orig_ue_agg
+
     # Get four_pred from model
     if hasattr(model, 'four_pred'):
         four_pred = model.four_pred.detach()
     else:
         raise AttributeError("Model does not have 'four_pred' attribute after forward()")
-    
+
     # Get uncertainty if available
     uncertainty = None
     ue_mask = None
-    
+
     if args.first_stage_ue:
         try:
             if hasattr(model, 'std_four_pred_five_crops'):
                 uncertainty = model.std_four_pred_five_crops.detach()
                 uncertainty_mean = uncertainty.view(uncertainty.shape[0], -1).mean(dim=1)
-                
                 ue_mask = torch.ones(len(uncertainty_mean), dtype=torch.bool)
                 for threshold in args.ue_rej_std:
                     if threshold < float('inf'):
                         ue_mask = ue_mask & (uncertainty_mean <= threshold)
         except Exception:
             pass
-    
-    return four_pred, uncertainty, ue_mask
+
+    return four_pred, uncertainty, ue_mask, stage_times
 
 def _save_results(df, output_path, logger):
     """Save results with logging"""
@@ -639,6 +741,9 @@ def run_js_loop(cli_args):
     skipped_count = 0
     error_count = 0
     successful_count = 0
+
+    # Per-stage accumulators for bottleneck summary
+    stage_accum = defaultdict(list)
     
     # Sample resource usage at start of inference
     resource_monitor.sample()
@@ -686,13 +791,15 @@ def run_js_loop(cli_args):
                 # Use _predict_four_points which has the monkey-patch fix for netG
                 four_pred, uncertainty, ue_mask = _predict_four_points(model, img1, img2, args) # TODO define consts outside for
 
-                if args.device.type == "cuda":
-                    torch.cuda.synchronize(args.device)
-                elapsed = time.perf_counter() - start_time
-                
+                _sync()
+                elapsed = time.perf_counter() - t_total
                 times.append(elapsed)
 
-                # Process predictions
+                # Accumulate per-stage times
+                for k, v in stage_times.items():
+                    stage_accum[k].append(v)
+
+                # ── Post-process predictions ──────────────────────────────────
                 four_point_1 = four_pred + four_point_org_single
                 four_point_1 = four_point_1.flatten(2).permute(0, 2, 1).contiguous()
                 four_point_1 = four_point_1 * scale
@@ -703,7 +810,7 @@ def run_js_loop(cli_args):
                 # Uncertainty
                 unc_value = np.nan
                 is_accepted = 1
-                
+
                 if uncertainty is not None:
                     unc_value = uncertainty.view(-1).mean().cpu().item()
                     if ue_mask is not None and len(ue_mask) > 0:
@@ -731,16 +838,21 @@ def run_js_loop(cli_args):
                 ])
                 successful_count += 1
 
-                if i % 10 == 0 or i == 0:
-                    center_x = (flat_points[0] + flat_points[2] + flat_points[4] + flat_points[6]) / 4
-                    center_y = (flat_points[1] + flat_points[3] + flat_points[5] + flat_points[7]) / 4
-                    status = "OK" if is_accepted else "REJ"
-                    logger.info(
-                        f"Img {i+1:4d}/{cli_args.num_samples} [{status}] | "
-                        f"Ctr: ({center_x:7.1f}, {center_y:7.1f}) | "
-                        f"T: {elapsed:.3f}s | "
-                        f"Sat{sat_idx}_T{th_idx}"
-                    )
+                # ── Per-sample log (every sample, not just every 10) ──────────
+                status = "OK " if is_accepted else "REJ"
+                stage_str = "  ".join(
+                    f"{k.split('_',1)[1].replace('_ms','').replace('_',' ')}={v:.0f}ms"
+                    for k, v in sorted(stage_times.items())
+                )
+                logger.info(
+                    f"[{i+1:4d}/{cli_args.num_samples}] {status} "
+                    f"Sat{sat_idx}_T{th_idx} | "
+                    f"total={elapsed*1000:.0f}ms | load={load_ms:.0f}ms | {stage_str} | "
+                    f"unc={unc_value:.4f}" if not np.isnan(unc_value)
+                    else f"[{i+1:4d}/{cli_args.num_samples}] {status} "
+                         f"Sat{sat_idx}_T{th_idx} | "
+                         f"total={elapsed*1000:.0f}ms | load={load_ms:.0f}ms | {stage_str}"
+                )
 
             except Exception as e:
                 error_count += 1
@@ -809,6 +921,77 @@ def run_js_loop(cli_args):
                 logger.info(f"    GPU Memory: +{delta['gpu_memory_delta_gb']:.2f} GB")
             if delta.get('pytorch_allocated_delta_gb') is not None:
                 logger.info(f"    PyTorch Allocated: +{delta['pytorch_allocated_delta_gb']:.2f} GB")
+
+    # ============================================================
+    # BOTTLENECK SUMMARY TABLE
+    # ============================================================
+    if stage_accum:
+        skip = cli_args.warmup_skip
+        logger.info("\n" + "=" * 60)
+        logger.info("BOTTLENECK BREAKDOWN  (avg ms per sample, excl. warmup)")
+        logger.info("=" * 60)
+
+        stage_labels = {
+            "0_img_load_ms":       "Image load (disk->CPU)",
+            "1_transfer_ms":       "Host->device transfer",
+            "2_set_input_ms":      "set_input (resize)",
+            "3a_ue_generate_ms":   "UE crop generation",
+            "3b_coarse_netG_ms":   "Coarse netG (IHN, K1=6)",
+            "3c_crop_extract_ms":  "Fine crop extraction",
+            "3d_fine_netG_ms":     "Fine netG (K2=6)",
+            "3e_ue_aggregation_ms":"UE aggregation (std)",
+            "3_forward_total_ms":  "Forward total",
+        }
+
+        total_avg = np.mean(times[skip:]) * 1000 if len(times) > skip else 1.0
+
+        rows = []
+        for key in sorted(stage_accum.keys()):
+            vals = stage_accum[key][skip:] if len(stage_accum[key]) > skip else stage_accum[key]
+            if not vals:
+                continue
+            avg_ms  = np.mean(vals)
+            med_ms  = np.median(vals)
+            max_ms  = np.max(vals)
+            label   = stage_labels.get(key, key)
+            pct     = avg_ms / total_avg * 100 if total_avg > 0 else 0
+            bar     = "|" * int(pct / 4)
+            rows.append((pct, label, avg_ms, med_ms, max_ms, bar))
+
+        rows.sort(reverse=True)  # biggest first
+
+        logger.info(f"  {'Stage':<30} {'Avg':>7} {'Med':>7} {'Max':>7}  {'%':>5}  Bar")
+        logger.info(f"  {'-'*30} {'-'*7} {'-'*7} {'-'*7}  {'-'*5}  ---")
+        for pct, label, avg_ms, med_ms, max_ms, bar in rows:
+            logger.info(
+                f"  {label:<30} {avg_ms:>6.1f}ms {med_ms:>6.1f}ms {max_ms:>6.1f}ms  {pct:>4.1f}%  {bar}"
+            )
+        logger.info("")
+
+        # Highlight the winner
+        if rows:
+            bottleneck_name = rows[0][1]
+            bottleneck_pct  = rows[0][0]
+            colored_print(
+                f"  ► BOTTLENECK: {bottleneck_name} ({bottleneck_pct:.1f}% of total time)",
+                Colors.RED, bold=True
+            )
+
+            # Actionable advice
+            advice = {
+                "Image load":        "Consider pre-loading images into RAM or using a DataLoader with num_workers>0.",
+                "Host->device":       "Use non_blocking=True transfers and pin_memory on your DataLoader.",
+                "set_input":         "The F.interpolate of the satellite is here. Try pre-resizing offline.",
+                "UE crop generation":"5 crops × forward = 5× cost. Try --ue_num_crops 3 and compare uncertainty quality.",
+                "Coarse netG":       "Try reducing --iters_lev0 from 6->4 and check if accuracy drops.",
+                "Fine crop":         "get_cropped_st_images calls crop_and_resize. This is usually fast; likely not the issue.",
+                "Fine netG":         "Try reducing --iters_lev1 from 6->4 and check if accuracy drops.",
+                "UE aggregation":    "std computation over 5 crops is cheap. If this shows high, check for NaN recovery loops.",
+            }
+            for key_hint, tip in advice.items():
+                if key_hint.lower() in bottleneck_name.lower():
+                    colored_print(f"  ✦ Tip: {tip}", Colors.YELLOW)
+                    break
 
     # ============================================================
     # SAVE RESULTS
