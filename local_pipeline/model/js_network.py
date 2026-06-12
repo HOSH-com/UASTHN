@@ -338,7 +338,7 @@ class UASTHN():
         # Generate Crops & Augment
         if self.args.first_stage_ue and self.ue_method == "augment":
             self.first_stage_ue_generate()
-
+    
         # Run First Stage
         if self.args.first_stage_ue:
             if self.ue_method == "ensemble":
@@ -595,21 +595,30 @@ class UASTHN():
                 # Recover shift
                 four_preds_recovered_list = []
                 for i in range(agg_step):
+                    # Formula 4: X_rct
                     four_point_org_single_repeat = self.four_point_org_single.repeat(four_preds_list[i].shape[0],1,1,1)
                     four_corners = four_preds_list[i] + four_point_org_single_repeat # B x 2 x 2 x 2
+                    # Formula 1
                     H_StoT = tgm.get_perspective_transform(self.xct_before, four_corners.view(-1, 2, 4).permute(0, 2, 1).contiguous())
-                    # H_StoT = get_perspective_transform_torch(self.xct_before, four_corners.view(-1, 2, 4).permute(0, 2, 1).contiguous())
+                    # Formula 2: self.H_CTtoT
+                    # Formula 3: X_rt
                     H_StoT_inv = torch.linalg.inv(H_StoT)
                     four_corners_aug = torch.cat([four_corners.view(four_corners.shape[0], 2, 4),
                                                   torch.ones((four_corners.shape[0], 1, 4)).to(four_corners.device)], dim=1) # B x 3 x 4
+                    x_rct_bef_assumed = torch.bmm(self.H_CTtoT, torch.bmm(H_StoT_inv, four_corners_aug))
+                    x_rct_bef_assumed = x_rct_bef_assumed[:,:2,:] / x_rct_bef_assumed[:,2:,:] # B x 2 x 4
                     four_corners = torch.bmm(H_StoT, torch.bmm(self.H_CTtoT, torch.bmm(H_StoT_inv, four_corners_aug))) # B x 3 x 4
                     four_corners = four_corners[:,:2,:] / four_corners[:,2:,:] # B x 2 x 4
+                    # Formula 5: D_rs→rt
                     four_preds_recovered_single = four_corners.view(four_corners.shape[0], 2, 2, 2) - four_point_org_single_repeat
                     four_preds_recovered_list.append(four_preds_recovered_single)
+
                 for i in range(agg_step, len(four_preds_list)):
                     four_preds_recovered_list.append(four_preds_list[i])
+
                 four_preds_list = four_preds_recovered_list
-        four_pred = four_preds_list[check_step]
+
+        four_pred = four_preds_list[check_step]  # Last Iteration Ds
         
         four_pred_five_crops = None
         
@@ -620,11 +629,13 @@ class UASTHN():
 
         assert four_pred_five_crops is not None
 
+        # UE
         if self.args.ue_outlier_method != "none" and self.args.ue_outlier_num != 0 and not for_training:
-            mace_distance = (four_pred_five_crops[:, :1] - four_pred_five_crops)**2
-            mace_distance = (mace_distance[:, :, 0] + mace_distance[:, :, 1])**0.5
-            mace_distance = mace_distance.mean(dim=2).mean(dim=2)
+            mace_distance = (four_pred_five_crops[:, :1] - four_pred_five_crops)**2  # (D_t - D_ct)^2
+            mace_distance = (mace_distance[:, :, 0] + mace_distance[:, :, 1])**0.5  # rad(dx^2 + dy^2)
+            mace_distance = mace_distance.mean(dim=2).mean(dim=2)  # mean
             mask = torch.ones((four_pred_five_crops.shape[0], four_pred_five_crops.shape[1])).to(four_pred_five_crops.device)
+            
             if self.args.ue_outlier_method == "max":
                 _, max_indices = torch.topk(mace_distance, self.args.ue_outlier_num, dim=1)
                 for i in range(self.args.ue_outlier_num):
@@ -637,11 +648,13 @@ class UASTHN():
                         _, min_indices = torch.topk(mace_distance[i], self.args.ue_num_crops - self.args.ue_outlier_num, largest=False)
                         mask[i] = False
                         mask[i] = mask[i].scatter_(0, min_indices, 1.)
+
             four_pred_five_crops_res = four_pred_five_crops[mask.bool()].view(four_pred_five_crops.shape[0], four_pred_five_crops.shape[1] - self.args.ue_outlier_num, 2, 2, 2)
             std_four_pred_five_crops = torch.std(four_pred_five_crops_res, dim=1)
             print(mace_distance)
         else:
             std_four_pred_five_crops = torch.std(four_pred_five_crops, dim=1)
+            std = std_four_pred_five_crops.view(std_four_pred_five_crops.shape[0], -1).mean(dim=1)
 
         # Aggregate Final Displacement
         if check_step == -1:
