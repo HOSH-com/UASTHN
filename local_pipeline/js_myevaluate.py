@@ -731,7 +731,10 @@ def run_js_loop(cli_args):
                 ])
                 successful_count += 1
 
-                if i % 10 == 0 or i == 0:
+                show_indices = set(np.linspace(0, cli_args.num_samples - 1, 20, dtype=int))
+
+                # Then in your loop:
+                if i in show_indices:
                     center_x = (flat_points[0] + flat_points[2] + flat_points[4] + flat_points[6]) / 4
                     center_y = (flat_points[1] + flat_points[3] + flat_points[5] + flat_points[7]) / 4
                     status = "OK" if is_accepted else "REJ"
