@@ -178,10 +178,14 @@ def _build_runtime_args(cli_args):
     """
     args = argparse.Namespace()
 
+    # Customized UASTHN
+    args.custom = cli_args.custom
+
     # Dataset settings
     args.dataset_name = "UASTHN_Inference"
     args.resize_width = cli_args.resize_width
     args.database_size = cli_args.database_size
+    args.database_size_large = cli_args.database_size_large
     args.lev0 = True
     args.arch = "IHN"
     
@@ -238,6 +242,7 @@ def _build_runtime_args(cli_args):
         args.ue_ensemble_load_models = None
     
     args.ue_aug_method = "shift"
+    args.semi_random_crops_types = cli_args.semi_random_crops_types
     args.crop_width = args.resize_width - cli_args.ue_shift  # 256 - 32 = 224
     args.ue_num_crops = cli_args.ue_num_crops if cli_args.enable_uncertainty else 1
     args.ue_shift_crops_types = cli_args.ue_shift_crops_types if cli_args.enable_uncertainty else "random"
@@ -373,11 +378,15 @@ def _load_model_weights(model, args, logger):
 
 def _create_reference_points(args):
     """Create reference corner coordinates"""
+    if args.custom == 'satcrop':
+        sat_resized = args.database_size_large / (args.database_size / args.resize_width)
+    else:
+        sat_resized = args.resize_width
     four_point_org_single = torch.zeros((1, 2, 2, 2), device=args.device)
     four_point_org_single[:, :, 0, 0] = torch.tensor([0, 0], device=args.device)
-    four_point_org_single[:, :, 0, 1] = torch.tensor([args.resize_width - 1, 0], device=args.device)
-    four_point_org_single[:, :, 1, 0] = torch.tensor([0, args.resize_width - 1], device=args.device)
-    four_point_org_single[:, :, 1, 1] = torch.tensor([args.resize_width - 1, args.resize_width - 1], device=args.device)
+    four_point_org_single[:, :, 0, 1] = torch.tensor([sat_resized - 1, 0], device=args.device)
+    four_point_org_single[:, :, 1, 0] = torch.tensor([0, sat_resized - 1], device=args.device)
+    four_point_org_single[:, :, 1, 1] = torch.tensor([sat_resized - 1, sat_resized - 1], device=args.device)
     return four_point_org_single
 
 
@@ -514,6 +523,7 @@ def run_js_loop(cli_args):
     # Build arguments
     logger.info("\nBuilding runtime arguments...")
     args = _build_runtime_args(cli_args)
+    scale = args.database_size / args.resize_width
     
     resource_monitor.checkpoint("Args building complete")
     
@@ -523,7 +533,7 @@ def run_js_loop(cli_args):
     logger.info("=" * 60)
     logger.info(f"Resize width: {args.resize_width}px")
     logger.info(f"Database size: {args.database_size}px")
-    logger.info(f"Scale factor: {args.database_size / args.resize_width:.1f}x")
+    logger.info(f"Scale factor: {scale:.1f}x")
     logger.info(f"Stage 1 iterations: {args.iters_lev0}")
     logger.info(f"Stage 2 iterations: {args.iters_lev1}")
     logger.info(f"Correlation level: {args.corr_level}")
@@ -581,8 +591,7 @@ def run_js_loop(cli_args):
         transforms.ToTensor(),
     ])
 
-    four_point_org_single = _create_reference_points(args)
-    scale = args.database_size / args.resize_width
+    four_point_resized_satellite = _create_reference_points(args)
 
     # Setup paths
     satellite_dir = _resolve_path(cli_args.satellite_dir)
@@ -693,7 +702,7 @@ def run_js_loop(cli_args):
                 times.append(elapsed)
 
                 # Process predictions
-                four_point_1 = four_pred + four_point_org_single
+                four_point_1 = four_pred + four_point_resized_satellite
                 four_point_1 = four_point_1.flatten(2).permute(0, 2, 1).contiguous()
                 four_point_1 = four_point_1 * scale
 
@@ -711,6 +720,24 @@ def run_js_loop(cli_args):
                     uncertainties.append(unc_value)
                     accepted_flags.append(is_accepted)
 
+                # IHN1 Iters
+                iter_vals = []
+                for iter_i in range(0, args.iters_lev0):
+                    four_point_iter = model.four_preds_list[iter_i][0] + four_point_resized_satellite
+                    four_point_iter = four_point_iter.flatten(2).permute(0, 2, 1).contiguous()
+                    four_point_iter = four_point_iter * scale
+                    iter_points = four_point_iter.squeeze(0).cpu().tolist()
+                    iter_vals.extend([coord for point in iter_points for coord in point])
+
+                # IHN1 Crops
+                crop_vals = []
+                for crop_i in range(1, args.ue_num_crops):
+                    four_point_crop = model.four_preds_list[-1][crop_i] + four_point_resized_satellite
+                    four_point_crop = four_point_crop.flatten(2).permute(0, 2, 1).contiguous()
+                    four_point_crop = four_point_crop * scale
+                    crop_points = four_point_crop.squeeze(0).cpu().tolist()
+                    crop_vals.extend([coord for point in crop_points for coord in point])
+
                 # Store results
                 all_corners.append([
                     i,                    # 1. image_index
@@ -727,7 +754,10 @@ def run_js_loop(cli_args):
                     img1_path,           # 10. satellite_path
                     img2_path,           # 11. thermal_path
                     unc_value,           # 14. uncertainty
-                    is_accepted          # 15. accepted
+                    is_accepted,          # 15. accepted
+                    *iter_vals,          # 16-31. IHN1 iter corners
+                    *crop_vals           # 32-71. IHN1 crop corners
+
                 ])
                 successful_count += 1
 
@@ -818,6 +848,25 @@ def run_js_loop(cli_args):
     logger.info("=" * 60)
     
     # Updated columns with correct sat/th as integers
+    iter_cols = []
+    for iter_i in range(1, args.iters_lev0 + 1):
+        iter_cols.extend([
+            f'x1_{iter_i}', f'y1_{iter_i}',
+            f'x2_{iter_i}', f'y2_{iter_i}',
+            f'x3_{iter_i}', f'y3_{iter_i}',
+            f'x4_{iter_i}', f'y4_{iter_i}',
+        ])
+
+    crop_cols = []
+    for crop_i in range(1, args.ue_num_crops):
+        crop_cols.extend([
+                f'xc1_{crop_i}', f'yc1_{crop_i}',
+                f'xc2_{crop_i}', f'yc2_{crop_i}',
+                f'xc3_{crop_i}', f'yc3_{crop_i}',
+                f'xc4_{crop_i}', f'yc4_{crop_i}',
+            ])
+    
+
     columns = [
         "img_idx",       # 1
         "sat_idx",          # 10
@@ -830,7 +879,10 @@ def run_js_loop(cli_args):
         "th",                # 13 (now integer)
         "ue",                  # 14
         "acc",          # 15
+        *iter_cols,
+        *crop_cols
     ]
+
     
     df = pd.DataFrame(all_corners, columns=columns)
     _save_results(df, output_excel, logger)
@@ -872,6 +924,10 @@ Examples:
   python js_myevaluate.py --eval_model model.pth --enable_uncertainty --ue_rej_std 0.5 1.0 2.0
         """
     )
+    # UASTHN Customization
+    parser.add_argument("--custom", type=str, default=None, choices=[None, "satcrop"])  # TODO add 2 thresh thermal-crop 
+    parser.add_argument("--database_size_large", type=int, default=1746, help="database_size_large for satcrop mode (default: 1746)."
+                        " database_size is a crop from database_size_large.")
 
     # Model paths
     parser.add_argument("--eval_model", type=str, default="model.pt", 
@@ -928,8 +984,9 @@ Examples:
     parser.add_argument("--ue_shift", type=int, default=32, 
                        help="Crop offset in pixels (o_c=32 from paper)")
     parser.add_argument("--ue_shift_crops_types", type=str, default="random", 
-                       choices=["random", "grid"], 
+                       choices=["random", "grid", "semi_random"], 
                        help="Crop sampling method (random from paper)")
+    parser.add_argument("--semi_random_crops_types", type=str, default="plus", choices=["plus", "cross", "plus_cross"])
     parser.add_argument("--ue_std_method", type=str, default="all", 
                        choices=["any", "all", "mean"], 
                        help="Uncertainty aggregation method (all from paper)")

@@ -258,6 +258,22 @@ class UASTHN():
         self.four_point_org_large_single[:, :, 0, 1] = torch.Tensor([self.args.database_size - 1, 0]).to(self.device)
         self.four_point_org_large_single[:, :, 1, 0] = torch.Tensor([0, self.args.database_size - 1]).to(self.device)
         self.four_point_org_large_single[:, :, 1, 1] = torch.Tensor([self.args.database_size - 1, self.args.database_size - 1]).to(self.device) # Only to calculate flow so no -1
+
+        if self.args.custom == "satcrop":
+            alpha = self.args.database_size / self.args.resize_width
+            w_rs = self.args.database_size_large // alpha
+            self.four_point_org_xrs_single = torch.zeros((1, 2, 2, 2)).to(self.device)
+            self.four_point_org_xrs_single[:, :, 0, 0] = torch.Tensor([0, 0]).to(self.device)
+            self.four_point_org_xrs_single[:, :, 0, 1] = torch.Tensor([w_rs - 1, 0]).to(self.device)
+            self.four_point_org_xrs_single[:, :, 1, 0] = torch.Tensor([0, w_rs - 1]).to(self.device)
+            self.four_point_org_xrs_single[:, :, 1, 1] = torch.Tensor([w_rs - 1, w_rs - 1]).to(self.device)
+
+            self.four_point_org_xs_single = torch.zeros((1, 2, 2, 2)).to(self.device)
+            self.four_point_org_xs_single[:, :, 0, 0] = torch.Tensor([0, 0]).to(self.device)
+            self.four_point_org_xs_single[:, :, 0, 1] = torch.Tensor([self.args.database_size_large - 1, 0]).to(self.device)
+            self.four_point_org_xs_single[:, :, 1, 0] = torch.Tensor([0, self.args.database_size_large - 1]).to(self.device)
+            self.four_point_org_xs_single[:, :, 1, 1] = torch.Tensor([self.args.database_size_large - 1, self.args.database_size_large - 1]).to(self.device)
+
         if self.args.first_stage_ue and self.ue_method == "ensemble":
             self.ensemble_model_names_raw = open(args.ue_ensemble_load_models, "r").readlines()
             self.ensemble_model_names = []
@@ -335,11 +351,11 @@ class UASTHN():
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
         
         # time1 = time.time()
-        # Generate Crops & Augment
+        # --- Generate Crops & Augment ---
         if self.args.first_stage_ue and self.ue_method == "augment":
             self.first_stage_ue_generate()
     
-        # Run First Stage
+        # --- Run First Stage ---
         if self.args.first_stage_ue:
             if self.ue_method == "ensemble":
                 four_preds_list_ensemble = []
@@ -359,7 +375,7 @@ class UASTHN():
         else:
             self.four_preds_list, self.four_pred = self.netG(image1=self.image_1, image2=self.image_2, iters_lev0=self.args.iters_lev0, corr_level=self.args.corr_level)
 
-        # First Stage Aggregation
+        # --- First Stage Aggregation ---
         # self.four_preds_list = [self.four_preds_list[-1]]
         if self.args.first_stage_ue:
             # for i in range(len(self.four_preds_list)): # DEBUG
@@ -369,16 +385,8 @@ class UASTHN():
             #     pass
                 # self.fake_warped_image_2_multi_before = mywarp(self.image_2, self.four_preds_list[self.args.check_step], self.four_point_org_single) # Comment for performance evaluation 
             
-            # print('*** bef four_pred', self.four_pred.shape)
-            # print('*** bef four_preds_list', self.four_preds_list.__len__())
-            # print('*** bef four_preds_list', self.four_preds_list[0].shape)
             if self.ue_method != "single":
                 self.four_preds_list, self.four_pred = self.first_stage_ue_aggregation(self.four_preds_list, for_training)
-            # print('*** aft four_pred', self.four_pred.shape)
-            # print('*** aft four_preds_list', self.four_preds_list.__len__())
-            # print('*** aft four_preds_list', self.four_preds_list[0].shape)
-            # print('*** bef1', self.image_1.shape)
-            # print('*** bef2', self.image_2.shape)
 
             if self.ue_method == "augment":
                 B5, C, H, W = self.image_2.shape
@@ -390,12 +398,11 @@ class UASTHN():
                 self.image_2 = self.image_2.view(B5//self.args.ue_num_crops, self.args.ue_num_crops, C, H, W)[:, 0]
             elif self.ue_method == "single":
                 self.std_four_pred_five_crops = torch.sqrt(torch.exp(self.four_pred_ue_list[-1]))
-            # print('*** aft1', self.image_1.shape)
-            # print('*** aft2', self.image_2.shape)
         # time2 = time.time()
         # logging.debug("Time for 1st forward pass: " + str(time2 - time1) + " seconds")
 
-        # Run Second Stage
+
+        # --- Run Second Stage ---
         if self.args.two_stages and not (self.ue_method == "ensemble" and self.args.ue_method == "augment_ensemble"):
             # self.four_pred = self.flow_4cor # DEBUG
             # self.four_preds_list[-1] = self.four_pred # DEBUG
@@ -413,7 +420,7 @@ class UASTHN():
             # self.four_preds_list_fine[-1] = self.four_pred_fine # DEBUG
             # print(self.four_pred[0])
             # print(self.four_pred_fine[0])
-            self.four_preds_list, self.four_pred = self.combine_coarse_fine(self.four_preds_list, self.four_pred, self.four_preds_list_fine, self.four_pred_fine, delta, self.flow_bbox, for_training)
+            self.four_preds_list_fine, self.four_pred = self.combine_coarse_fine(self.four_preds_list, self.four_pred, self.four_preds_list_fine, self.four_pred_fine, delta, self.flow_bbox, for_training)
             # print(self.four_pred[0])
             # raise KeyError()
         if self.args.vis_all:
@@ -440,11 +447,27 @@ class UASTHN():
                 self.image_2 = self.image_2.view(B5//self.args.ue_num_crops, self.args.ue_num_crops, C, H, W)[:, 0]
 
     def get_cropped_st_images(self, image_1_ori, four_pred, fine_padding, detach=True, augment_two_stages=0):
-        # From four_pred to bbox coordinates
-        four_point = four_pred + self.four_point_org_single
+        '''
+        Inputs:
+        - image_1_ori: original image_1
+        - four_pred: (D rs→rt) IHN1 displacement of resized img2 from resized img1
+        - fine_padding: padding for bbox crop
+
+        Return:
+        - image_1_crop: padded-squared-resized bbox crop of image_1_ori
+        - delta: ratio of bbox to resize_width
+        - flow_bbox: (D s→b) Displacement of bbox corners from original corners
+        '''
+        # D rs→rt to X rt
+        if self.args.custom == 'satcrop':
+            four_point = four_pred + self.four_point_org_xrs_single
+        else:
+            four_point = four_pred + self.four_point_org_single
+
         x = four_point[:, 0]
         y = four_point[:, 1]
         # Make it same scale as image_1_ori
+        # X rt to X t
         alpha = self.args.database_size / self.args.resize_width
         x[:, :, 0] = x[:, :, 0] * alpha
         x[:, :, 1] = (x[:, :, 1] + 1) * alpha
@@ -476,11 +499,17 @@ class UASTHN():
         bbox_s = bbox.bbox_generator(x_start, y_start, w_padded, w_padded)
         delta = (w_padded / self.args.resize_width).unsqueeze(1).unsqueeze(1).unsqueeze(1)
         image_1_crop = tgm.crop_and_resize(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width)) # It will be padded when it is out of boundary
-        # image_1_crop = crop_and_resize_torch(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width)) # It will be padded when it is out of boundary
         # swap bbox_s
         bbox_s_swap = torch.stack([bbox_s[:, 0], bbox_s[:, 1], bbox_s[:, 3], bbox_s[:, 2]], dim=1)
+        # X b
         four_cor_bbox = bbox_s_swap.permute(0, 2, 1). view(-1, 2, 2, 2)
-        flow_bbox = four_cor_bbox - self.four_point_org_large_single
+
+        # X b to D s→b
+        if self.args.custom == 'satcrop':
+            flow_bbox = four_cor_bbox - self.four_point_org_xs_single
+        else:
+            flow_bbox = four_cor_bbox - self.four_point_org_large_single
+
         if detach:
             image_1_crop = image_1_crop.detach()
             delta = delta.detach()
@@ -488,9 +517,21 @@ class UASTHN():
         return image_1_crop, delta, flow_bbox
     
     def combine_coarse_fine(self, four_preds_list, four_pred, four_preds_list_fine, four_pred_fine, delta, flow_bbox, for_training):
+        '''
+        Inputs:
+        - four_pred: (D rs→rt) IHN1 displacement of resized img2 from resized img1
+        - four_pred_fine: (D rb→rt) IHN2 displacement of resized img2 from resized bbox crop of img1
+        - delta: ratio of bbox to resize_width
+        - flow_bbox: (D s→b) Displacement of bbox corners from original corners
+
+        Return:
+        - four_pred_fine: (D rs→rt) Refined displacement of resized img2 from resized img1
+        '''
         alpha = self.args.database_size / self.args.resize_width
         kappa = delta / alpha
         four_preds_list_fine = [four_preds_list_fine_single * kappa + flow_bbox / alpha for four_preds_list_fine_single in four_preds_list_fine]
+        # D rs→rt = D rb→rt * kappa + D s→b / alpha
+        # D rs→rt = D rb→rt + D rs→rb
         four_pred_fine = four_pred_fine * kappa + flow_bbox / alpha
         four_preds_list = four_preds_list + four_preds_list_fine
         return four_preds_list, four_pred_fine
@@ -515,8 +556,15 @@ class UASTHN():
             self.image_2 = self.image_2.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
             if self.args.ue_aug_method == "shift":
                 bbox_s = self.first_stage_ue_generate_bbox()
-                self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
-                # self.image_2 = crop_and_resize_torch(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
+                
+                if self.args.custom == "satcrop":
+                    B, C, H, W = self.image_1_ori.shape
+                    image_1_ori = self.image_1_ori.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
+                    self.image_1 = tgm.crop_and_resize(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width))
+                    # print('*** self.image_1', self.image_1.shape)
+
+                else:
+                    self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
             elif self.args.ue_aug_method == "mask":
                 self.image_2 = self.image_2.view(B, self.args.ue_num_crops, C, H, W)
                 mask = torch.rand((self.image_2.shape[0], int(self.args.ue_num_crops - 1), 1, self.image_2.shape[3]//self.args.ue_mask_patchsize, self.image_2.shape[4]//self.args.ue_mask_patchsize)).to(self.image_2.device) > self.args.ue_mask_prob
@@ -539,49 +587,144 @@ class UASTHN():
         resized_ue_shift = self.args.ue_shift / beta
         x_start = torch.zeros((self.image_2.shape[0])).to(self.image_2.device)
         y_start = torch.zeros((self.image_2.shape[0])).to(self.image_2.device)
-        if self.args.ue_shift_crops_types == "grid":
-            resized_ue_shift_sample = resized_ue_shift
-            if self.args.ue_num_crops >= 2 and self.args.ue_num_crops <= 5:
-                x_shift_grid = np.linspace(0, resized_ue_shift_sample, 2) # 1 -> 1 2-4 -> 4 5-9 -> 9    
-                y_shift_grid = np.linspace(0, resized_ue_shift_sample, 2)
+
+        if self.args.custom == "satcrop":
+            # one center crop and the rest random crops from the large image, with the same size as the center crop
+            self.args.ue_shift = self.args.database_size_large - self.args.database_size
+            resized_ue_shift = self.args.ue_shift
+            # center crop
+            half_shift = resized_ue_shift // 2
+            x_center_shift = [half_shift]
+            y_center_shift = [half_shift]
+            MIN_SHIFT = min(half_shift - 1, 30)
+
+            if self.args.ue_shift_crops_types == "semi_random":
+                # one center crop and the rest semi-random crops from the large image, with the same size as the center crop
+                if self.args.semi_random_crops_types == "plus":
+                    # 4 random plus shape crops (up, left, down, right)
+                    x_shift_random = [
+                        half_shift if i % 2 == 0 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
+                        for i in range(self.args.ue_num_crops - 1)
+                    ]
+                    y_shift_random = [
+                        half_shift if i % 2 == 1 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
+                        for i in range(self.args.ue_num_crops - 1)
+                    ]
+                    
+
+                elif self.args.semi_random_crops_types == "cross":
+                    # 4 random cross shape crops (top-left, top-right, bottom-left, bottom-right)
+                    x_shift_random = [
+                        half_shift + (-1 if i % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
+                        for i in range(self.args.ue_num_crops - 1)
+                    ]
+                    y_shift_random = [
+                        half_shift + (-1 if i % 4 > 1 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
+                        for i in range(self.args.ue_num_crops - 1)
+                    ]
+    
+
+                elif self.args.semi_random_crops_types == "plus_cross":
+                    # 4 random plus + 4 random cross shape crops
+                    # TODO: Implement this case
+                    pass
+
+            elif self.args.ue_shift_crops_types == "random":
+                x_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
+                y_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
+            
+            w_random = [self.args.database_size_large - resized_ue_shift for i in range(self.args.ue_num_crops)]
+            x_shift = torch.tensor(x_center_shift + x_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+            y_shift = torch.tensor(y_center_shift + y_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+            w = torch.tensor(w_random, dtype=torch.float).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+
+        else:
+            if self.args.ue_shift_crops_types == "grid":
+                resized_ue_shift_sample = resized_ue_shift
+                if self.args.ue_num_crops >= 2 and self.args.ue_num_crops <= 5:
+                    x_shift_grid = np.linspace(0, resized_ue_shift_sample, 2) # 1 -> 1 2-4 -> 4 5-9 -> 9    
+                    y_shift_grid = np.linspace(0, resized_ue_shift_sample, 2)
+                else:
+                    raise NotImplementedError()
+                x_shift_grid, y_shift_grid = np.meshgrid(x_shift_grid, y_shift_grid)
+                x_shift_grid = x_shift_grid.reshape(-1)
+                y_shift_grid = y_shift_grid.reshape(-1)
+                idx = list(range(len(x_shift_grid)))
+                self.ue_rng.shuffle(idx)
+                idx = idx[:self.args.ue_num_crops-1]
+                x_shift_grid_list = list(x_shift_grid[idx])
+                y_shift_grid_list = list(y_shift_grid[idx])
+                w_grid = [(self.args.resize_width - resized_ue_shift_sample) for i in range(len(x_shift_grid_list))]
+                x_shift = torch.tensor([0] + x_shift_grid_list).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device) # on 256x256
+                y_shift = torch.tensor([0] + y_shift_grid_list).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+                w = torch.tensor([self.args.resize_width] + w_grid, dtype=torch.float).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+            
+            elif self.args.ue_shift_crops_types == "random":
+                x_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
+                y_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
+                w_random = [self.args.resize_width - resized_ue_shift for i in range(self.args.ue_num_crops - 1)]
+                x_shift = torch.tensor([0] + x_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device) # on 256x256
+                y_shift = torch.tensor([0] + y_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+                w = torch.tensor([self.args.resize_width] + w_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+
+            elif self.args.ue_shift_crops_types == "semi_random":
+                half_shift = self.args.ue_shift // 2
+                MIN_SHIFT = min(half_shift - 1, 6)
+                MIN_SHIFT = min(half_shift - 1, 6)
+                
+                if self.args.semi_random_crops_types == "plus":
+                # 4 random plus shape crops (up, left, down, right)
+                    x_shift_random = [
+                        half_shift if i % 2 == 0 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
+                        for i in range(self.args.ue_num_crops - 1)
+                    ]
+                    y_shift_random = [
+                        half_shift if i % 2 == 1 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
+                        for i in range(self.args.ue_num_crops - 1)
+                    ]
+                    
+
+                elif self.args.semi_random_crops_types == "cross":
+                    # 4 random cross shape crops (top-left, top-right, bottom-left, bottom-right)
+                    x_shift_random = [
+                        half_shift + (-1 if i % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
+                        for i in range(self.args.ue_num_crops - 1)
+                    ]
+                    y_shift_random = [
+                        half_shift + (-1 if i % 4 > 1 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
+                        for i in range(self.args.ue_num_crops - 1)
+                    ]
+
+                w_random = [self.args.resize_width - self.args.ue_shift for i in range(self.args.ue_num_crops - 1)]
+                x_shift = torch.tensor([0] + x_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+                y_shift = torch.tensor([0] + y_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+                w = torch.tensor([self.args.resize_width] + w_random, dtype=torch.float).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+            
+            elif self.args.ue_shift_crops_types == "random_relax":
+                resized_ue_shift_list = [int(self.ue_rng.integers(1, 2*resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
+                x_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift_list[i])) for i in range(self.args.ue_num_crops - 1)]
+                y_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift_list[i])) for i in range(self.args.ue_num_crops - 1)]
+                w_random = [self.args.resize_width - resized_ue_shift_list[i] for i in range(self.args.ue_num_crops - 1)]
+                x_shift = torch.tensor([0] + x_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device) # on 256x256
+                y_shift = torch.tensor([0] + y_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+                w = torch.tensor([self.args.resize_width] + w_random, dtype=torch.float).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
             else:
                 raise NotImplementedError()
-            x_shift_grid, y_shift_grid = np.meshgrid(x_shift_grid, y_shift_grid)
-            x_shift_grid = x_shift_grid.reshape(-1)
-            y_shift_grid = y_shift_grid.reshape(-1)
-            idx = list(range(len(x_shift_grid)))
-            self.ue_rng.shuffle(idx)
-            idx = idx[:self.args.ue_num_crops-1]
-            x_shift_grid_list = list(x_shift_grid[idx])
-            y_shift_grid_list = list(y_shift_grid[idx])
-            w_grid = [(self.args.resize_width - resized_ue_shift_sample) for i in range(len(x_shift_grid_list))]
-            x_shift = torch.tensor([0] + x_shift_grid_list).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device) # on 256x256
-            y_shift = torch.tensor([0] + y_shift_grid_list).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
-            w = torch.tensor([self.args.resize_width] + w_grid, dtype=torch.float).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
-        elif self.args.ue_shift_crops_types == "random":
-            x_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
-            y_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
-            w_random = [self.args.resize_width - resized_ue_shift for i in range(self.args.ue_num_crops - 1)]
-            x_shift = torch.tensor([0] + x_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device) # on 256x256
-            y_shift = torch.tensor([0] + y_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
-            w = torch.tensor([self.args.resize_width] + w_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
-        elif self.args.ue_shift_crops_types == "random_relax":
-            resized_ue_shift_list = [int(self.ue_rng.integers(1, 2*resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
-            x_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift_list[i])) for i in range(self.args.ue_num_crops - 1)]
-            y_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift_list[i])) for i in range(self.args.ue_num_crops - 1)]
-            w_random = [self.args.resize_width - resized_ue_shift_list[i] for i in range(self.args.ue_num_crops - 1)]
-            x_shift = torch.tensor([0] + x_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device) # on 256x256
-            y_shift = torch.tensor([0] + y_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
-            w = torch.tensor([self.args.resize_width] + w_random, dtype=torch.float).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
-        else:
-            raise NotImplementedError()
+            
         x_start += x_shift
         y_start += y_shift
         bbox_s = bbox.bbox_generator(x_start, y_start, w, w)
         bbox_s_swap = torch.stack([bbox_s[:, 0], bbox_s[:, 1], bbox_s[:, 3], bbox_s[:, 2]], dim=1)
-        self.xct_before = bbox_s_swap
-        self.H_CTtoT = tgm.get_perspective_transform(bbox_s_swap, self.four_point_org_single.repeat(bbox_s_swap.shape[0],1,1,1).view(bbox_s_swap.shape[0], 2, 4).permute(0, 2, 1).contiguous())
-        # self.H_CTtoT = get_perspective_transform_torch(bbox_s_swap, self.four_point_org_single.repeat(bbox_s_swap.shape[0],1,1,1).view(bbox_s_swap.shape[0], 2, 4).permute(0, 2, 1).contiguous())
+        if self.args.custom == "satcrop":
+            alpha = self.args.database_size / self.args.resize_width
+            self.xrcs_before: torch.Tensor = bbox_s_swap / alpha  # 291 scale
+            # print("*** xrcs_before\n", self.xrcs_before)
+            self.xrcs_before = self.xrcs_before.permute(0, 2, 1).view(bbox_s_swap.shape[0], 2, 2, 2).contiguous() # B x 2 x 2 x 2
+            # print("*** xrcs_before\n", self.xrcs_before)
+        else:
+            self.xct_before: torch.Tensor = bbox_s_swap
+            self.H_CTtoT = tgm.get_perspective_transform(bbox_s_swap, self.four_point_org_single.repeat(bbox_s_swap.shape[0],1,1,1).view(bbox_s_swap.shape[0], 2, 4).permute(0, 2, 1).contiguous())
+        
         return bbox_s
 
     def ue_aggregation(self, four_preds_list, alpha, for_training, check_step=-1):
@@ -590,33 +733,48 @@ class UASTHN():
             agg_step = len(four_preds_list)
         else:
             agg_step = check_step + 1
-        if self.ue_method == "augment":
-            if self.args.ue_aug_method == "shift":
-                # Recover shift
-                four_preds_recovered_list = []
-                for i in range(agg_step):
-                    # Formula 4: X_rct
-                    four_point_org_single_repeat = self.four_point_org_single.repeat(four_preds_list[i].shape[0],1,1,1)
-                    four_corners = four_preds_list[i] + four_point_org_single_repeat # B x 2 x 2 x 2
-                    # Formula 1
-                    H_StoT = tgm.get_perspective_transform(self.xct_before, four_corners.view(-1, 2, 4).permute(0, 2, 1).contiguous())
-                    # Formula 2: self.H_CTtoT
-                    # Formula 3: X_rt
-                    H_StoT_inv = torch.linalg.inv(H_StoT)
-                    four_corners_aug = torch.cat([four_corners.view(four_corners.shape[0], 2, 4),
-                                                  torch.ones((four_corners.shape[0], 1, 4)).to(four_corners.device)], dim=1) # B x 3 x 4
-                    x_rct_bef_assumed = torch.bmm(self.H_CTtoT, torch.bmm(H_StoT_inv, four_corners_aug))
-                    x_rct_bef_assumed = x_rct_bef_assumed[:,:2,:] / x_rct_bef_assumed[:,2:,:] # B x 2 x 4
-                    four_corners = torch.bmm(H_StoT, torch.bmm(self.H_CTtoT, torch.bmm(H_StoT_inv, four_corners_aug))) # B x 3 x 4
-                    four_corners = four_corners[:,:2,:] / four_corners[:,2:,:] # B x 2 x 4
-                    # Formula 5: D_rs→rt
-                    four_preds_recovered_single = four_corners.view(four_corners.shape[0], 2, 2, 2) - four_point_org_single_repeat
-                    four_preds_recovered_list.append(four_preds_recovered_single)
 
-                for i in range(agg_step, len(four_preds_list)):
-                    four_preds_recovered_list.append(four_preds_list[i])
+        if self.args.custom == "satcrop":
+            four_preds_recovered_list = []
+            for i in range(agg_step):
+                four_corners = four_preds_list[i] + self.xrcs_before # B x 2 x 2 x 2
+                four_point_org_xrs_single_repeat = self.four_point_org_xrs_single.repeat(four_preds_list[i].shape[0],1,1,1)
+                four_preds_recovered_single = four_corners - four_point_org_xrs_single_repeat
+                four_preds_recovered_list.append(four_preds_recovered_single)
+                # print('*** four_preds_list[i]\n', four_preds_list[i])
+                # print('*** xrcs_before\n', self.xrcs_before)
+                # print('*** four_corners\n', four_corners)
+                # print('*** four_point_org_xrs_single_repeat\n', four_point_org_xrs_single_repeat)
+                # print('*** four_preds_recovered_single\n', four_preds_recovered_single)
 
-                four_preds_list = four_preds_recovered_list
+        else:
+            if self.ue_method == "augment":
+                if self.args.ue_aug_method == "shift":
+                    # Recover shift
+                    four_preds_recovered_list = []
+                    for i in range(agg_step):
+                        # Formula 4: X_rct
+                        four_point_org_single_repeat = self.four_point_org_single.repeat(four_preds_list[i].shape[0],1,1,1)
+                        four_corners = four_preds_list[i] + four_point_org_single_repeat # B x 2 x 2 x 2
+                        # Formula 1
+                        H_StoT = tgm.get_perspective_transform(self.xct_before, four_corners.view(-1, 2, 4).permute(0, 2, 1).contiguous())
+                        # Formula 2: self.H_CTtoT
+                        # Formula 3: X_rt
+                        H_StoT_inv = torch.linalg.inv(H_StoT)
+                        four_corners_aug = torch.cat([four_corners.view(four_corners.shape[0], 2, 4),
+                                                    torch.ones((four_corners.shape[0], 1, 4)).to(four_corners.device)], dim=1) # B x 3 x 4
+                        x_rct_bef_assumed = torch.bmm(self.H_CTtoT, torch.bmm(H_StoT_inv, four_corners_aug))
+                        x_rct_bef_assumed = x_rct_bef_assumed[:,:2,:] / x_rct_bef_assumed[:,2:,:] # B x 2 x 4
+                        four_corners = torch.bmm(H_StoT, torch.bmm(self.H_CTtoT, torch.bmm(H_StoT_inv, four_corners_aug))) # B x 3 x 4
+                        four_corners = four_corners[:,:2,:] / four_corners[:,2:,:] # B x 2 x 4
+                        # Formula 5: D_rs→rt
+                        four_preds_recovered_single = four_corners.view(four_corners.shape[0], 2, 2, 2) - four_point_org_single_repeat
+                        four_preds_recovered_list.append(four_preds_recovered_single)
+
+        for i in range(agg_step, len(four_preds_list)):
+            four_preds_recovered_list.append(four_preds_list[i])
+
+        four_preds_list = four_preds_recovered_list
 
         four_pred = four_preds_list[check_step]  # Last Iteration Ds
         
