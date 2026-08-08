@@ -213,6 +213,10 @@ def _build_runtime_args(cli_args):
     
     # Two-stage settings
     args.two_stages = cli_args.two_stages
+
+    # Threshold settings for two-pass uncertainty
+    args.hard_threshold = cli_args.hard_threshold
+    args.soft_threshold = cli_args.soft_threshold
     
     # ============================================================
     # UNCERTAINTY ESTIMATION SETTINGS
@@ -383,66 +387,98 @@ def _create_reference_points(args):
 
 def _predict_four_points(model, img1, img2, args):
     """
-    Predict 4-corner displacement.
-    Handles models that return variable number of values from netG.
+    Predict 4-corner displacement using adaptive two-pass uncertainty estimation.
+
+    Pass 1: 5 axial crops  →  ue1
+    Pass 2: 9-crop set     →  ue2  (only when hard < ue1 < soft)
+
+    Returns
+    -------
+    four_pred        : Tensor  (1, 2, 2, 2)  – final displacement
+    four_preds_list  : list[Tensor]           – per-iteration displacement (len = iters_lev0)
+    ue1_value        : float   – Pass-1 uncertainty (always)
+    ue2_value        : float | None – Pass-2 uncertainty (only in ambiguous zone)
+    ue_mask          : BoolTensor | None – acceptance mask based on ue_rej_std thresholds
     """
     img1 = img1.to(args.device)
     img2 = img2.to(args.device)
 
     dummy_flow = torch.zeros(
-        (img1.shape[0], 2, args.resize_width, args.resize_width), 
+        (img1.shape[0], 2, args.resize_width, args.resize_width),
         device=args.device
     )
 
     model.set_input(img1, img2, dummy_flow)
-    
-    # Monkey-patch netG to handle variable return values
-    # This fixes: "ValueError: too many values to unpack (expected 2)"
+
+    # ------------------------------------------------------------------ #
+    # Monkey-patch netG so it always returns exactly 2 values              #
+    # ------------------------------------------------------------------ #
     original_netG = model.netG
-    
+
     def wrapped_netG(**kwargs):
         result = original_netG(**kwargs)
         if isinstance(result, tuple):
             if len(result) >= 2:
-                # Take first two values (four_preds_list, four_pred)
                 return result[0], result[1]
             elif len(result) == 1:
                 return [], result[0]
         return [], result
-    
-    # Temporarily replace netG
+
     model.netG = wrapped_netG
-    
     try:
-        model.forward(for_test=True)
+        if args.first_stage_ue:
+            # Two-pass adaptive inference
+            model.forward_with_thresholds(for_test=True)
+        else:
+            model.forward(for_test=True)
     finally:
-        # Restore original netG
         model.netG = original_netG
-    
-    # Get four_pred from model
-    if hasattr(model, 'four_pred'):
-        four_pred = model.four_pred.detach()
-    else:
-        raise AttributeError("Model does not have 'four_pred' attribute after forward()")
-    
-    # Get uncertainty if available
-    uncertainty = None
-    ue_mask = None
-    
+
+    # ------------------------------------------------------------------ #
+    # Collect outputs                                                       #
+    # ------------------------------------------------------------------ #
+    if not hasattr(model, 'four_pred'):
+        raise AttributeError("Model does not have 'four_pred' after forward()")
+
+    four_pred        = model.four_pred.detach()
+    # four_preds_list: one tensor per IHN iteration, shape (B, 2, 2, 2) each.
+    # When uncertainty is used, aggregation may have modified the list; we
+    # take only the first iters_lev0 entries (the coarse-stage iterations).
+    raw_preds_list = getattr(model, 'four_preds_list', [])
+    # Each entry may have batch size B*ue_num_crops when UE is on; take crop 0.
+    four_preds_list = []
+    for p in raw_preds_list[:args.iters_lev0]:
+        p = p.detach()
+        if args.first_stage_ue and p.shape[0] > 1:
+            # Reshape to (B, ue_num_crops, 2, 2, 2) and pick the main crop (index 0)
+            try:
+                p = p.view(p.shape[0] // args.ue_num_crops, args.ue_num_crops, 2, 2, 2)[:, 0]
+            except Exception:
+                p = p[:1]  # fallback: just take first sample
+        four_preds_list.append(p)
+
+    ue1_value  = None
+    ue2_value  = None
+    ue_mask    = None
+
     if args.first_stage_ue:
         try:
-            if hasattr(model, 'std_four_pred_five_crops'):
-                uncertainty = model.std_four_pred_five_crops.detach()
-                uncertainty_mean = uncertainty.view(uncertainty.shape[0], -1).mean(dim=1)
-                
-                ue_mask = torch.ones(len(uncertainty_mean), dtype=torch.bool)
+            ue1_value = getattr(model, 'ue1_value', None)
+            ue2_value = getattr(model, 'ue2_value', None)
+
+            # Build acceptance mask from whichever uncertainty is final:
+            # use ue2 when it exists (refined pass), otherwise ue1
+            final_ue = ue2_value if ue2_value is not None else ue1_value
+            if final_ue is not None:
+                ue_mask = torch.ones(img1.shape[0], dtype=torch.bool)
                 for threshold in args.ue_rej_std:
                     if threshold < float('inf'):
-                        ue_mask = ue_mask & (uncertainty_mean <= threshold)
+                        ue_mask = ue_mask & (final_ue <= threshold)
         except Exception:
             pass
-    
-    return four_pred, uncertainty, ue_mask
+
+    return four_pred, four_preds_list, ue1_value, ue2_value, ue_mask
+
 
 def _save_results(df, output_path, logger):
     """Save results with logging"""
@@ -460,12 +496,19 @@ def _save_results(df, output_path, logger):
     logger.info(f"Total predictions: {len(df)}")
     
     # Log statistics
-    if 'uncertainty' in df.columns:
-        valid_unc = df['uncertainty'].dropna()
+    if 'ue1' in df.columns:
+        valid_unc = df['ue1'].dropna()
         if len(valid_unc) > 0:
-            logger.info(f"Uncertainty - Mean: {valid_unc.mean():.4f}, "
+            logger.info(f"UE1 (pass-1) - Mean: {valid_unc.mean():.4f}, "
                        f"Median: {valid_unc.median():.4f}, "
                        f"Max: {valid_unc.max():.4f}")
+    if 'ue2' in df.columns:
+        valid_unc2 = df['ue2'].dropna()
+        if len(valid_unc2) > 0:
+            logger.info(f"UE2 (pass-2, {len(valid_unc2)} images in ambiguous zone) - "
+                       f"Mean: {valid_unc2.mean():.4f}, "
+                       f"Median: {valid_unc2.median():.4f}, "
+                       f"Max: {valid_unc2.max():.4f}")
     
     if 'accepted' in df.columns:
         accepted_count = df['accepted'].sum() if df['accepted'].dtype == bool else (df['accepted'] == 1).sum()
@@ -639,6 +682,7 @@ def run_js_loop(cli_args):
     skipped_count = 0
     error_count = 0
     successful_count = 0
+    refinement_count = 0  # how many images triggered Pass 2
     
     # Sample resource usage at start of inference
     resource_monitor.sample()
@@ -667,7 +711,7 @@ def run_js_loop(cli_args):
 
             if not os.path.exists(img1_path) or not os.path.exists(img2_path):
                 skipped_count += 1
-                all_corners.append([i] + [np.nan]*8 + [img1_path, img2_path, sat_idx, th_idx, np.nan, 0])
+                all_corners.append([i, sat_idx, th_idx] + [np.nan]*8 + [img1_path, img2_path, np.nan, np.nan, 0] + [np.nan] * (8 * args.iters_lev0))
                 continue
 
             try:
@@ -684,7 +728,7 @@ def run_js_loop(cli_args):
                     torch.cuda.synchronize(args.device)
 
                 # Use _predict_four_points which has the monkey-patch fix for netG
-                four_pred, uncertainty, ue_mask = _predict_four_points(model, img1, img2, args) # TODO define consts outside for
+                four_pred, four_preds_list, uncertainty, uncertainty2, ue_mask = _predict_four_points(model, img1, img2, args) # TODO define consts outside for
 
                 if args.device.type == "cuda":
                     torch.cuda.synchronize(args.device)
@@ -692,7 +736,7 @@ def run_js_loop(cli_args):
                 
                 times.append(elapsed)
 
-                # Process predictions
+                # Process final predictions
                 four_point_1 = four_pred + four_point_org_single
                 four_point_1 = four_point_1.flatten(2).permute(0, 2, 1).contiguous()
                 four_point_1 = four_point_1 * scale
@@ -700,35 +744,57 @@ def run_js_loop(cli_args):
                 points = four_point_1.squeeze(0).cpu().tolist()
                 flat_points = [coord for point in points for coord in point]
 
+                # Process per-iteration predictions (same scaling as final pred)
+                iter_flat_points = []  # list of 8-element lists, one per iteration
+                for iter_pred in four_preds_list:
+                    iter_pt = iter_pred + four_point_org_single
+                    iter_pt = iter_pt.flatten(2).permute(0, 2, 1).contiguous()
+                    iter_pt = iter_pt * scale
+                    iter_coords = iter_pt.squeeze(0).cpu().tolist()
+                    iter_flat = [coord for point in iter_coords for coord in point]
+                    iter_flat_points.append(iter_flat)
+                # Pad missing iterations with NaN (in case fewer iterations ran)
+                while len(iter_flat_points) < args.iters_lev0:
+                    iter_flat_points.append([np.nan] * 8)
+
                 # Uncertainty
                 unc_value = np.nan
+                unc2_value = np.nan
                 is_accepted = 1
                 
                 if uncertainty is not None:
-                    unc_value = uncertainty.view(-1).mean().cpu().item()
+                    unc_value = uncertainty.view(-1).mean().cpu().item() if hasattr(uncertainty, 'view') else float(uncertainty)
+                    if uncertainty2 is not None:
+                        unc2_value = float(uncertainty2)
                     if ue_mask is not None and len(ue_mask) > 0:
                         is_accepted = int(ue_mask[0].item())
                     uncertainties.append(unc_value)
                     accepted_flags.append(is_accepted)
 
                 # Store results
+                # Build iteration columns: for each iteration k, store x1_k,y1_k,...,x4_k,y4_k
+                iter_cols = []
+                for iter_flat in iter_flat_points:
+                    iter_cols.extend(iter_flat)  # 8 values per iteration
+
                 all_corners.append([
                     i,                    # 1. image_index
-                    sat_idx,             # 12. sat (fixed: use sat_idx instead of path)
-                    th_idx,              # 13. th (fixed: use th_idx instead of path)
-                    flat_points[0],      # 2. x1
-                    flat_points[1],      # 3. y1
-                    flat_points[2],      # 4. x2
-                    flat_points[3],      # 5. y2
-                    flat_points[4],      # 6. x3
-                    flat_points[5],      # 7. y3
-                    flat_points[6],      # 8. x4
-                    flat_points[7],      # 9. y4
-                    img1_path,           # 10. satellite_path
-                    img2_path,           # 11. thermal_path
-                    unc_value,           # 14. uncertainty
-                    is_accepted          # 15. accepted
-                ])
+                    sat_idx,             # 2. sat_idx
+                    th_idx,              # 3. th_idx
+                    flat_points[0],      # 4. x1
+                    flat_points[1],      # 5. y1
+                    flat_points[2],      # 6. x2
+                    flat_points[3],      # 7. y2
+                    flat_points[4],      # 8. x3
+                    flat_points[5],      # 9. y3
+                    flat_points[6],      # 10. x4
+                    flat_points[7],      # 11. y4
+                    img1_path,           # 12. satellite_path
+                    img2_path,           # 13. thermal_path
+                    unc_value,           # 14. ue1 (pass-1 uncertainty, always)
+                    unc2_value,          # 15. ue2 (pass-2 uncertainty, NaN if not ambiguous)
+                    is_accepted,         # 16. accepted
+                ] + iter_cols)           # 17+. x1_1,y1_1,...,x4_6,y4_6 (8 * iters_lev0 cols)
                 successful_count += 1
 
                 show_indices = set(np.linspace(0, cli_args.num_samples - 1, 20, dtype=int))
@@ -750,7 +816,7 @@ def run_js_loop(cli_args):
                 if error_count <= 3:
                     logger.error(f"❌ Error image {i}: {e}")
                     traceback.print_exc()
-                all_corners.append([i] + [np.nan]*8 + [img1_path, img2_path, sat_idx, th_idx, np.nan, 0])
+                all_corners.append([i] + [np.nan]*8 + [img1_path, img2_path, sat_idx, th_idx, np.nan, np.nan, 0] + [np.nan] * (8 * args.iters_lev0))
 
     # End inference time tracking
     inference_end_time = time.perf_counter()
@@ -820,20 +886,27 @@ def run_js_loop(cli_args):
     logger.info("SAVING RESULTS")
     logger.info("=" * 60)
     
-    # Updated columns with correct sat/th as integers
+    # Build column names: fixed columns + per-iteration columns
+    iter_columns = []
+    for k in range(1, args.iters_lev0 + 1):
+        for corner in range(1, 5):
+            iter_columns.append(f"x{corner}_{k}")
+            iter_columns.append(f"y{corner}_{k}")
+
     columns = [
         "img_idx",       # 1
-        "sat_idx",          # 10
-        "th_idx",            # 11
-        "x1", "y1",          # 2,3
-        "x2", "y2",          # 4,5
-        "x3", "y3",          # 6,7
-        "x4", "y4",          # 8,9
-        "sat",               # 12 (now integer)
-        "th",                # 13 (now integer)
-        "ue",                  # 14
-        "acc",          # 15
-    ]
+        "sat_idx",       # 2
+        "th_idx",        # 3
+        "x1", "y1",      # 4,5   – final prediction corner 1
+        "x2", "y2",      # 6,7   – final prediction corner 2
+        "x3", "y3",      # 8,9   – final prediction corner 3
+        "x4", "y4",      # 10,11 – final prediction corner 4
+        "sat",           # 12 (satellite path)
+        "th",            # 13 (thermal path)
+        "ue1",           # 14 (pass-1 uncertainty, always set)
+        "ue2",           # 15 (pass-2 uncertainty, NaN if not in ambiguous zone)
+        "acc",           # 16
+    ] + iter_columns     # x1_1,y1_1,...,x4_6,y4_6
     
     df = pd.DataFrame(all_corners, columns=columns)
     _save_results(df, output_excel, logger)
@@ -919,6 +992,10 @@ Examples:
                        help="Number of initial inferences to skip for timing stats")
     parser.add_argument("--disable_tqdm", action="store_true", 
                        help="Disable tqdm progress bar")
+    # thresholds for Uncertenty
+    parser.add_argument("--soft_threshold", type=int, default=10)
+    parser.add_argument("--hard_threshold", type=int, default=4)
+    
 
     # ============================================================
     # UNCERTAINTY ESTIMATION PARAMETERS
