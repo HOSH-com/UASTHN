@@ -20,7 +20,7 @@ import datasets_4cor_img as datasets
 import numpy as np
 
 from model.js_kornia_replacement import (
-    get_perspective_transform_torch, 
+    get_perspective_transform_torch,
     crop_and_resize_torch,
 )
 
@@ -33,9 +33,9 @@ class IHN(nn.Module):
         self.device = torch.device(args.device)
 
         if timer is None:
-            self.global_timing = TimingTracker()  
+            self.global_timing = TimingTracker()
         else:
-            self.global_timing = timer  
+            self.global_timing = timer
         self.args = args
         self.ue_method = ue_method
         self.hidden_dim = 128
@@ -115,7 +115,7 @@ class IHN(nn.Module):
 
         return coords0, coords1
 
-    def forward(self, image1, image2, iters_lev0 = 6, iters_lev1=6, corr_level=2, corr_radius=4, early_stop=-1):
+    def forward(self, image1, image2, iters_lev0 = 6, iters_lev1=6, corr_level=2, corr_radius=4, early_stop=-1, coords1_disp=None):
         # image1 = 2 * (image1 / 255.0) - 1.0
         # image2 = 2 * (image2 / 255.0) - 1.0
         stage = ""
@@ -153,8 +153,23 @@ class IHN(nn.Module):
         self. global_timing.start(f"CorrBlock Initialazation {stage}")
         # print(fmap1.shape, fmap2.shape)
         corr_fn = CorrBlock(fmap1, fmap2, num_levels=corr_level, radius=corr_radius)
-        
+
         coords0, coords1 = self.initialize_flow_4(image1)
+        # print(coords1.shape)
+        if coords1_disp is not None:
+            # Global translation applied to the whole quarter-resolution grid,
+            # used by the 'ue_sec points' secondary uncertainty pass to start
+            # the iterative refinement from an offset location instead of the
+            # identity (coords0 == coords1) initialization.
+            # print('### coords1 bef\n', coords1.shape, coords1)
+            # print('### coords1_disp\n', coords1_disp.shape, coords1_disp)
+            # coords1 = coords1 + coords1_disp.to(coords1.device).view(coords1.shape[0], 2, 1, 1)
+            coords1_disp_mul4 = coords1_disp * 4
+            sz = fmap1_64.shape
+            self.sz = sz
+            coords1 = self.get_flow_now_4(coords1_disp_mul4)
+            # print('### coords1 aft\n', coords1.shape, coords1)
+
         if self.args.check_step != -1 and self.first_stage and self.ue_method == "augment":
             B, C, H, W = fmap1.shape
             corr_fn_early = CorrBlock(fmap1.view(B//self.args.ue_num_crops, self.args.ue_num_crops, C, H, W)[:, 0], fmap2.view(B//self.args.ue_num_crops, self.args.ue_num_crops, C, H, W)[:, 0], num_levels=corr_level, radius=corr_radius)
@@ -222,7 +237,7 @@ class IHN(nn.Module):
                     self.sz = torch.Size([self.sz[0]//self.args.ue_num_crops, self.sz[1], self.sz[2], self.sz[3]])
                     four_point_disp = four_point_disp.view(four_point_disp.shape[0]//self.args.ue_num_crops, self.args.ue_num_crops, 2, 2, 2)[:, 0]
                     coords1_early = coords1.view(coords1.shape[0]//self.args.ue_num_crops, self.args.ue_num_crops, coords1.shape[1], coords1.shape[2], coords1.shape[3])[:, 0]
-            
+
             if early_stop!=-1 and itr==early_stop:
                 break
         # self.global_timing.end(f"for {stage}")
@@ -303,7 +318,7 @@ class UASTHN():
                     self.optimizer_G, self.scheduler_G = fetch_optimizer(args,list(self.netG_fine.parameters()))
             else:
                 self.optimizer_G, self.scheduler_G = fetch_optimizer(args, list(self.netG.parameters()))
-            
+
     def setup(self):
         if hasattr(self, 'netD'):
             self.netD = self.init_net(self.netD)
@@ -323,14 +338,14 @@ class UASTHN():
         #     model = model.to(self.device)
         model = model.to(self.device)
         return model
-    
+
     def set_input(self, A, B, flow_gt=None, neg_A=None):
         self.image_1_ori = A.to(self.device, non_blocking=True)
         self.image_2 = B.to(self.device, non_blocking=True)
         self.flow_gt = flow_gt.to(self.device, non_blocking=True)
         if self.flow_gt is not None:
             if self.args.vis_all:
-                self.real_warped_image_2 = mywarp(datasets.base_transforms(self.image_2), self.flow_gt, self.four_point_org_single) # Comment for performance evaluation 
+                self.real_warped_image_2 = mywarp(datasets.base_transforms(self.image_2), self.flow_gt, self.four_point_org_single) # Comment for performance evaluation
             self.flow_4cor = torch.zeros((self.flow_gt.shape[0], 2, 2, 2)).to(self.flow_gt.device)
             self.flow_4cor[:, :, 0, 0] = self.flow_gt[:, :, 0, 0]
             self.flow_4cor[:, :, 0, 1] = self.flow_gt[:, :, 0, -1]
@@ -340,21 +355,21 @@ class UASTHN():
             self.real_warped_image_2 = None
         self.image_1 = F.interpolate(self.image_1_ori, size=self.args.resize_width, mode='bilinear', align_corners=True, antialias=True)
         if self.args.vis_all:
-            self.image_1_show = datasets.base_transforms(self.image_1) # Comment for performance evaluation 
+            self.image_1_show = datasets.base_transforms(self.image_1) # Comment for performance evaluation
         if neg_A is not None:
             self.image_1_neg_ori = neg_A.to(self.device, non_blocking=True)
             self.image_1_neg = F.interpolate(self.image_1_neg_ori, size=self.args.resize_width, mode='bilinear', align_corners=True, antialias=True)
         else:
             self.image_1_neg = None
-        
+
     def forward(self, for_training=False, for_test=False):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
-        
+
         # time1 = time.time()
         # --- Generate Crops & Augment ---
         if self.args.first_stage_ue and self.ue_method == "augment":
             self.first_stage_ue_generate()
-    
+
         # --- Run First Stage ---
         if self.args.first_stage_ue:
             if self.ue_method == "ensemble":
@@ -383,10 +398,32 @@ class UASTHN():
             # self.four_pred = self.flow_4cor # DEBUG
             # if self.ue_method == "augment":
             #     pass
-                # self.fake_warped_image_2_multi_before = mywarp(self.image_2, self.four_preds_list[self.args.check_step], self.four_point_org_single) # Comment for performance evaluation 
-            
+                # self.fake_warped_image_2_multi_before = mywarp(self.image_2, self.four_preds_list[self.args.check_step], self.four_point_org_single) # Comment for performance evaluation
+
             if self.ue_method != "single":
                 self.four_preds_list, self.four_pred = self.first_stage_ue_aggregation(self.four_preds_list, for_training)
+
+            # --- Secondary uncertainty pass: random-offset starting points ---
+            # Must run *before* self.image_1/self.image_2 get sliced back down
+            # below, so it sees all `ue_num_crops` CropTTA crop variations
+            # combined with the `ue_sec_points_n` random-offset starts
+            # (ue_num_crops * ue_sec_points_n predictions per tile).
+            ue_sec = getattr(self.args, "ue_sec", "none")
+            self.four_preds_list_ue_sec, self.four_pred_ue_sec, self.std_four_pred_ue_sec = None, None, None
+            if ue_sec is not 'none' and self.ue_method != "ensemble":
+                # TODO IMPLEMENT FOR BATCH GREATER THAN 1 
+
+                if self.std_four_pred_five_crops.shape[0] != 1:
+                    raise NotImplementedError("Only batch size 1 is supported for ue_sec!")
+                ue = self.std_four_pred_five_crops.view(self.std_four_pred_five_crops.shape[0], -1).mean(dim=1).item()
+
+                if self.args.ue_sec_trigger_range[0] <= ue <= self.args.ue_sec_trigger_range[1]:
+                    print('!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+
+                    if ue_sec == "points":
+                        print("!!! ue", ue, self.std_four_pred_five_crops)
+                        # if 
+                        self.four_preds_list_ue_sec, self.four_pred_ue_sec, self.std_four_pred_ue_sec = self.run_ue_sec_points()
 
             if self.ue_method == "augment":
                 B5, C, H, W = self.image_2.shape
@@ -398,9 +435,19 @@ class UASTHN():
                 self.image_2 = self.image_2.view(B5//self.args.ue_num_crops, self.args.ue_num_crops, C, H, W)[:, 0]
             elif self.ue_method == "single":
                 self.std_four_pred_five_crops = torch.sqrt(torch.exp(self.four_pred_ue_list[-1]))
+        else:
+            # No CropTTA active (ue_num_crops == 1): still run the secondary
+            # pass, on the plain per-tile batch.
+            if getattr(self.args, "ue_sec", "none") == "points":
+                # init attr
+                self.std_four_pred_sec_points = None
+
+                self.run_ue_sec_points()
+
         # time2 = time.time()
         # logging.debug("Time for 1st forward pass: " + str(time2 - time1) + " seconds")
 
+        # TODO IMPLEMENT UE REJECTION
 
         # --- Run Second Stage ---
         if self.args.two_stages and not (self.ue_method == "ensemble" and self.args.ue_method == "augment_ensemble"):
@@ -425,6 +472,119 @@ class UASTHN():
             # raise KeyError()
         if self.args.vis_all:
             self.fake_warped_image_2 = mywarp(datasets.base_transforms(self.image_2), self.four_pred, self.four_point_org_single) # Comment for performance evaluation
+
+    def _sample_ue_sec_points_offsets(self, n):
+        """Sample per-repeat global (dx, dy) offsets used to initialize coords1
+        away from coords0 for the '--ue_sec points' secondary uncertainty pass.
+
+        The first offset is always (0, 0), matching the normal/primary
+        prediction (coords0 == coords1). The remaining (n - 1) offsets are
+        drawn so that the overlap between the shifted and un-shifted
+        quarter-resolution grids stays at least `ue_sec_points_width / grid_size`
+        (e.g. width=48 on a 64-sized grid guarantees >= 3/4 overlap).
+        """
+        grid_size = self.args.resize_width // 4
+        width = self.args.ue_sec_points_width
+        max_offset = grid_size - width
+
+        # offsets = torch.zeros((n, 2), device=self.device)
+        if n > 1 and max_offset > 0:
+            if self.args.ue_sec_points_mode != "rand":
+                raise NotImplementedError(
+                    f"ue_sec_points_mode='{self.args.ue_sec_points_mode}' is not implemented yet"
+                )
+            # offsets[1:] = (torch.rand((n - 1, 2), device=self.device) * 2 - 1) * max_offset
+            offsets = torch.tensor(self.ue_rng.integers(0, max_offset + 1, size=(n, 2)), device=self.device)
+        return offsets
+
+    def run_ue_sec_points(self):
+        """Secondary uncertainty pass ('--ue_sec points'): re-run the coarse
+        (first) stage `ue_sec_points_n` times for each of the `ue_num_crops`
+        CropTTA crop variations, using different global square-bbox offsets.
+
+        coords1_offset has shape (B_total * n, 2, 2, 2):
+            [batch, x/y, up/down, left/right]
+
+        The four corners represent displacement of the square bbox relative
+        to the constant large frame of size `resize_width // 4`.
+        """
+        B_total, C, H, W = self.image_1.shape
+        num_crops = self.args.ue_num_crops
+        B = B_total // num_crops
+        n = self.args.ue_sec_points_n - 1
+
+        img1_rep = (self.image_1.unsqueeze(1).repeat(1, n, 1, 1, 1).view(B_total * n, C, H, W))
+        img2_rep = (self.image_2.unsqueeze(1).repeat(1, n, 1, 1, 1).view(B_total * n, C, H, W))
+
+        # Sample upper-left corner of each square bbox.
+        # Shape: (n, 2), where [:, 0] = x and [:, 1] = y.
+        offsets_single = self._sample_ue_sec_points_offsets(n)
+
+        frame = self.args.resize_width // 4
+        width = self.args.ue_sec_points_width
+
+        # Convert upper-left bbox offsets into displacement of all 4 corners.
+        #
+        # Shape:
+        #   (n, 2, 2, 2)
+        #    │  │  │  └── left/right
+        #    │  │  └───── up/down
+        #    │  └──────── x/y
+        #    └─────────── sampled offset
+        #
+        # The bbox coordinates are measured relative to the large frame,
+        # so the displacement of the right/bottom edge is:
+        #
+        #     offset + width - frame
+        #
+        dx = offsets_single[:, 0]
+        dy = offsets_single[:, 1]
+
+        corner_disp = torch.zeros((n, 2, 2, 2), device=offsets_single.device, dtype=offsets_single.dtype,)
+
+        # x displacement
+        corner_disp[:, 0, 0, 0] = dx
+        corner_disp[:, 0, 0, 1] = dx + width - frame
+        corner_disp[:, 0, 1, 0] = dx
+        corner_disp[:, 0, 1, 1] = dx + width - frame
+
+        # y displacement
+        corner_disp[:, 1, 0, 0] = dy
+        corner_disp[:, 1, 0, 1] = dy
+        corner_disp[:, 1, 1, 0] = dy + width - frame
+        corner_disp[:, 1, 1, 1] = dy + width - frame
+
+        # Repeat the same n offsets for every image/crop in the batch.
+        # Final shape: (B_total * n, 2, 2, 2)
+        start_points_disp = (corner_disp.unsqueeze(0).repeat(B_total, 1, 1, 1, 1).view(B_total * n, 2, 2, 2))
+
+        # Bypass the CropTTA early-stop/ue_num_crops-based batch splitting
+        # inside IHN.forward, since this pass has its own batch layout.
+        prev_check_step = self.args.check_step
+        self.args.check_step = -1
+
+        try:
+            four_pred_list, four_pred = self.netG(
+                image1=img1_rep,
+                image2=img2_rep,
+                iters_lev0=self.args.iters_lev0,
+                corr_level=self.args.corr_level,
+                coords1_disp=start_points_disp,
+            )
+        finally:
+            self.args.check_step = prev_check_step
+
+
+        four_pred = four_pred.view(B, num_crops, n, 2, 2, 2)
+
+        combined = four_pred.reshape(B, num_crops * n, 2, 2, 2)
+
+        std_four_pred = torch.std(combined, dim=1)  # (B, 2, 2, 2)
+
+        # print('@@@ self.four_pred\n', self.std_four_pred_five_crops, self.four_pred.shape, self.four_pred)
+        # print('@@@ four_pred\n', std_four_pred, four_pred.shape, four_pred)
+
+        return four_pred_list, four_pred, std_four_pred
 
     def forward_neg(self, for_training=False):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
@@ -515,7 +675,7 @@ class UASTHN():
             delta = delta.detach()
             flow_bbox = flow_bbox.detach()
         return image_1_crop, delta, flow_bbox
-    
+
     def combine_coarse_fine(self, four_preds_list, four_pred, four_preds_list_fine, four_pred_fine, delta, flow_bbox, for_training):
         '''
         Inputs:
@@ -538,48 +698,32 @@ class UASTHN():
 
     def first_stage_ue_generate(self, neg_forward=False):
         B, C, H, W = self.image_2.shape
-        if neg_forward:
-            self.image_1_neg = self.image_1_neg.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
-            self.image_2 = self.image_2.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
-            if self.args.ue_aug_method == "shift":
-                bbox_s = self.first_stage_ue_generate_bbox()
-                self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
-                # self.image_2 = crop_and_resize_torch(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
-            elif self.args.ue_aug_method == "mask":
-                self.image_2 = self.image_2.view(B, self.args.ue_num_crops, C, H, W)
-                mask = torch.rand((self.image_2.shape[0], int(self.args.ue_num_crops - 1), 1, self.image_2.shape[3]//self.args.ue_mask_patchsize, self.image_2.shape[4]//self.args.ue_mask_patchsize)).to(self.image_2.device) > self.args.ue_mask_prob
-                mask = torch.repeat_interleave(torch.repeat_interleave(mask, self.args.ue_mask_patchsize, dim=3), self.args.ue_mask_patchsize, dim=4)
-                self.image_2[:, 1:] = self.image_2[:, 1:] * mask
-                self.image_2 = self.image_2.view(B*self.args.ue_num_crops, C, H, W)    
-        else:
-            self.image_1 = self.image_1.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
-            self.image_2 = self.image_2.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
-            if self.args.ue_aug_method == "shift":
-                bbox_s = self.first_stage_ue_generate_bbox()
-                
-                if self.args.custom == "satcrop":
-                    B, C, H, W = self.image_1_ori.shape
-                    image_1_ori = self.image_1_ori.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
-                    self.image_1 = tgm.crop_and_resize(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width))
-                    # print('*** self.image_1', self.image_1.shape)
 
-                else:
-                    self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
-            elif self.args.ue_aug_method == "mask":
-                self.image_2 = self.image_2.view(B, self.args.ue_num_crops, C, H, W)
-                mask = torch.rand((self.image_2.shape[0], int(self.args.ue_num_crops - 1), 1, self.image_2.shape[3]//self.args.ue_mask_patchsize, self.image_2.shape[4]//self.args.ue_mask_patchsize)).to(self.image_2.device) > self.args.ue_mask_prob
-                mask = torch.repeat_interleave(torch.repeat_interleave(mask, self.args.ue_mask_patchsize, dim=3), self.args.ue_mask_patchsize, dim=4)
-                self.image_2[:, 1:] = self.image_2[:, 1:] * mask
-                self.image_2 = self.image_2.view(B*self.args.ue_num_crops, C, H, W)            
+        self.image_1 = self.image_1.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
+        self.image_2 = self.image_2.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
+        if self.args.ue_aug_method == "shift":
+            bbox_s = self.first_stage_ue_generate_bbox()
+
+            if self.args.custom == "satcrop":
+                B, C, H, W = self.image_1_ori.shape
+                image_1_ori = self.image_1_ori.unsqueeze(1).repeat(1, self.args.ue_num_crops, 1, 1, 1).view(B*self.args.ue_num_crops, C, H, W)
+                self.image_1 = tgm.crop_and_resize(image_1_ori, bbox_s, (self.args.resize_width, self.args.resize_width))
+                # print('*** self.image_1', self.image_1.shape)
+
+            else:
+                self.image_2 = tgm.crop_and_resize(self.image_2, bbox_s, (self.args.resize_width, self.args.resize_width))
+        elif self.args.ue_aug_method == "mask":
+            self.image_2 = self.image_2.view(B, self.args.ue_num_crops, C, H, W)
+            mask = torch.rand((self.image_2.shape[0], int(self.args.ue_num_crops - 1), 1, self.image_2.shape[3]//self.args.ue_mask_patchsize, self.image_2.shape[4]//self.args.ue_mask_patchsize)).to(self.image_2.device) > self.args.ue_mask_prob
+            mask = torch.repeat_interleave(torch.repeat_interleave(mask, self.args.ue_mask_patchsize, dim=3), self.args.ue_mask_patchsize, dim=4)
+            self.image_2[:, 1:] = self.image_2[:, 1:] * mask
+            self.image_2 = self.image_2.view(B*self.args.ue_num_crops, C, H, W)
 
     def first_stage_ue_aggregation(self, four_preds_list, for_training, neg_forward=False):
         alpha = self.args.database_size / self.args.resize_width
-        if not neg_forward:
-            four_preds_list, four_pred, self.std_four_preds_list, self.std_four_pred_five_crops = self.ue_aggregation(four_preds_list, alpha, for_training, self.args.check_step)
-            # print("Positve UE std: " + str((self.std_four_pred_five_crops[0]))) # Comment for performance evaluation
-        else:
-            four_preds_list, four_pred, self.std_four_preds_neg_list, self.std_four_pred_five_crops_neg = self.ue_aggregation(four_preds_list, alpha, for_training, self.args.check_step)
-            # print("Negative UE std: " + str((self.std_four_pred_five_crops_neg[0]))) # Comment for performance evaluation
+
+        four_preds_list, four_pred, self.std_four_preds_list, self.std_four_pred_five_crops = self.ue_aggregation(four_preds_list, alpha, for_training, self.args.check_step)
+        # print("Positve UE std: " + str((self.std_four_pred_five_crops[0]))) # Comment for performance evaluation
         return four_preds_list, four_pred
 
     def first_stage_ue_generate_bbox(self):
@@ -610,7 +754,7 @@ class UASTHN():
                         half_shift if i % 2 == 1 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
                         for i in range(self.args.ue_num_crops - 1)
                     ]
-                    
+
 
                 elif self.args.semi_random_crops_types == "cross":
                     # 4 random cross shape crops (top-left, top-right, bottom-left, bottom-right)
@@ -622,7 +766,7 @@ class UASTHN():
                         half_shift + (-1 if i % 4 > 1 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
                         for i in range(self.args.ue_num_crops - 1)
                     ]
-    
+
 
                 elif self.args.semi_random_crops_types == "plus_cross":
                     # 4 random plus + 4 random cross shape crops
@@ -632,7 +776,7 @@ class UASTHN():
             elif self.args.ue_shift_crops_types == "random":
                 x_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
                 y_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
-            
+
             w_random = [self.args.database_size_large - resized_ue_shift for i in range(self.args.ue_num_crops)]
             x_shift = torch.tensor(x_center_shift + x_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
             y_shift = torch.tensor(y_center_shift + y_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
@@ -642,7 +786,7 @@ class UASTHN():
             if self.args.ue_shift_crops_types == "grid":
                 resized_ue_shift_sample = resized_ue_shift
                 if self.args.ue_num_crops >= 2 and self.args.ue_num_crops <= 5:
-                    x_shift_grid = np.linspace(0, resized_ue_shift_sample, 2) # 1 -> 1 2-4 -> 4 5-9 -> 9    
+                    x_shift_grid = np.linspace(0, resized_ue_shift_sample, 2) # 1 -> 1 2-4 -> 4 5-9 -> 9
                     y_shift_grid = np.linspace(0, resized_ue_shift_sample, 2)
                 else:
                     raise NotImplementedError()
@@ -658,7 +802,7 @@ class UASTHN():
                 x_shift = torch.tensor([0] + x_shift_grid_list).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device) # on 256x256
                 y_shift = torch.tensor([0] + y_shift_grid_list).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
                 w = torch.tensor([self.args.resize_width] + w_grid, dtype=torch.float).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
-            
+
             elif self.args.ue_shift_crops_types == "random":
                 x_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
                 y_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
@@ -671,7 +815,7 @@ class UASTHN():
                 half_shift = self.args.ue_shift // 2
                 MIN_SHIFT = min(half_shift - 1, 6)
                 MIN_SHIFT = min(half_shift - 1, 6)
-                
+
                 if self.args.semi_random_crops_types == "plus":
                 # 4 random plus shape crops (up, left, down, right)
                     x_shift_random = [
@@ -682,7 +826,7 @@ class UASTHN():
                         half_shift if i % 2 == 1 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
                         for i in range(self.args.ue_num_crops - 1)
                     ]
-                    
+
 
                 elif self.args.semi_random_crops_types == "cross":
                     # 4 random cross shape crops (top-left, top-right, bottom-left, bottom-right)
@@ -699,7 +843,7 @@ class UASTHN():
                 x_shift = torch.tensor([0] + x_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
                 y_shift = torch.tensor([0] + y_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
                 w = torch.tensor([self.args.resize_width] + w_random, dtype=torch.float).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
-            
+
             elif self.args.ue_shift_crops_types == "random_relax":
                 resized_ue_shift_list = [int(self.ue_rng.integers(1, 2*resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
                 x_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift_list[i])) for i in range(self.args.ue_num_crops - 1)]
@@ -710,7 +854,7 @@ class UASTHN():
                 w = torch.tensor([self.args.resize_width] + w_random, dtype=torch.float).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
             else:
                 raise NotImplementedError()
-            
+
         x_start += x_shift
         y_start += y_shift
         bbox_s = bbox.bbox_generator(x_start, y_start, w, w)
@@ -724,11 +868,11 @@ class UASTHN():
         else:
             self.xct_before: torch.Tensor = bbox_s_swap
             self.H_CTtoT = tgm.get_perspective_transform(bbox_s_swap, self.four_point_org_single.repeat(bbox_s_swap.shape[0],1,1,1).view(bbox_s_swap.shape[0], 2, 4).permute(0, 2, 1).contiguous())
-        
+
         return bbox_s
 
     def ue_aggregation(self, four_preds_list, alpha, for_training, check_step=-1):
-        
+
         if check_step == -1:
             agg_step = len(four_preds_list)
         else:
@@ -777,9 +921,9 @@ class UASTHN():
         four_preds_list = four_preds_recovered_list
 
         four_pred = four_preds_list[check_step]  # Last Iteration Ds
-        
+
         four_pred_five_crops = None
-        
+
         if self.ue_method == "ensemble":
             four_pred_five_crops = four_pred.view(four_pred.shape[0]//len(self.netG_list), len(self.netG_list), 2, 2, 2)
         elif self.ue_method == "augment":
@@ -793,7 +937,7 @@ class UASTHN():
             mace_distance = (mace_distance[:, :, 0] + mace_distance[:, :, 1])**0.5  # rad(dx^2 + dy^2)
             mace_distance = mace_distance.mean(dim=2).mean(dim=2)  # mean
             mask = torch.ones((four_pred_five_crops.shape[0], four_pred_five_crops.shape[1])).to(four_pred_five_crops.device)
-            
+
             if self.args.ue_outlier_method == "max":
                 _, max_indices = torch.topk(mace_distance, self.args.ue_outlier_num, dim=1)
                 for i in range(self.args.ue_outlier_num):
@@ -840,7 +984,7 @@ class UASTHN():
                     four_pred_single = four_preds_list[i].view(four_preds_list[i].shape[0], 1, 2, 2, 2)
             else:
                 four_pred_single = four_preds_list[i].view(four_preds_list[i].shape[0], 1, 2, 2, 2)
-            
+
             std_four_pred_single = torch.std(four_pred_single, dim=1)
             four_preds_std_list_new.append(std_four_pred_single)
         return four_preds_list, four_pred_new, four_preds_std_list_new, std_four_pred_five_crops
@@ -867,9 +1011,9 @@ class UASTHN():
         """Calculate GAN and L1 loss for the generator"""
         # Second, G(A) = B
         if self.ue_method == "single":
-            self.loss_G_Homo, self.metrics = self.criterionAUX(self.four_preds_list, self.four_pred, self.flow_gt, self.args.gamma, self.args, self.metrics, four_ue_list=self.four_pred_ue_list) 
+            self.loss_G_Homo, self.metrics = self.criterionAUX(self.four_preds_list, self.four_pred, self.flow_gt, self.args.gamma, self.args, self.metrics, four_ue_list=self.four_pred_ue_list)
         else:
-            self.loss_G_Homo, self.metrics = self.criterionAUX(self.four_preds_list, self.four_pred, self.flow_gt, self.args.gamma, self.args, self.metrics) 
+            self.loss_G_Homo, self.metrics = self.criterionAUX(self.four_preds_list, self.four_pred, self.flow_gt, self.args.gamma, self.args, self.metrics)
         # combine loss and calculate gradients
         self.loss_G = self.loss_G_Homo
         self.metrics["G_loss"] = self.loss_G.cpu().item()
@@ -879,9 +1023,9 @@ class UASTHN():
         """Calculate GAN and L1 loss for the generator"""
         # Second, G(A) = B
         if self.ue_method == "single":
-            self.loss_D, self.metrics = self.criterionNEG(self.args.gamma, self.args, self.metrics, self.four_pred_ue_neg_list) 
+            self.loss_D, self.metrics = self.criterionNEG(self.args.gamma, self.args, self.metrics, self.four_pred_ue_neg_list)
         else:
-            self.loss_D, self.metrics = self.criterionNEG(self.args.gamma, self.args, self.metrics, self.std_four_preds_neg_list) 
+            self.loss_D, self.metrics = self.criterionNEG(self.args.gamma, self.args, self.metrics, self.std_four_preds_neg_list)
         # combine loss and calculate gradients
         self.metrics["D_loss"] = self.loss_D.cpu().item()
         self.loss_D.backward()
@@ -937,9 +1081,9 @@ def mywarp(x, flow_pred, four_point_org_single, ue_std=None):
             flow_4cor = flow_pred
 
         four_point_1 = flow_4cor + four_point_org_single
-        
-        four_point_org = four_point_org_single.repeat(flow_pred.shape[0],1,1,1).flatten(2).permute(0, 2, 1).contiguous() 
-        four_point_1 = four_point_1.flatten(2).permute(0, 2, 1).contiguous() 
+
+        four_point_org = four_point_org_single.repeat(flow_pred.shape[0],1,1,1).flatten(2).permute(0, 2, 1).contiguous()
+        four_point_1 = four_point_1.flatten(2).permute(0, 2, 1).contiguous()
         try:
             H = tgm.get_perspective_transform(four_point_org, four_point_1)
         except Exception:
