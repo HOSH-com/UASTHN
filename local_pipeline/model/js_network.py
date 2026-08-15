@@ -17,7 +17,7 @@ import time
 import logging
 from model.baseline import DHN
 import datasets_4cor_img as datasets
-import numpy as np
+import numpy as np, math
 
 from model.js_kornia_replacement import (
     get_perspective_transform_torch,
@@ -731,6 +731,7 @@ class UASTHN():
         resized_ue_shift = self.args.ue_shift / beta
         x_start = torch.zeros((self.image_2.shape[0])).to(self.image_2.device)
         y_start = torch.zeros((self.image_2.shape[0])).to(self.image_2.device)
+        NUM_CROPS = self.args.ue_num_crops
 
         if self.args.custom == "satcrop":
             # one center crop and the rest random crops from the large image, with the same size as the center crop
@@ -741,45 +742,62 @@ class UASTHN():
             x_center_shift = [half_shift]
             y_center_shift = [half_shift]
             MIN_SHIFT = min(half_shift - 1, 30)
-
-            if self.args.ue_shift_crops_types == "semi_random":
-                # one center crop and the rest semi-random crops from the large image, with the same size as the center crop
-                if self.args.semi_random_crops_types == "plus":
-                    # 4 random plus shape crops (up, left, down, right)
-                    x_shift_random = [
-                        half_shift if i % 2 == 0 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
-                        for i in range(self.args.ue_num_crops - 1)
-                    ]
-                    y_shift_random = [
-                        half_shift if i % 2 == 1 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
-                        for i in range(self.args.ue_num_crops - 1)
-                    ]
+            CROP_WIDTH = self.args.database_size
+            FRAME_WIDTH = self.args.database_size_large
+            FRAME_SUB_CROP = FRAME_WIDTH - CROP_WIDTH
 
 
-                elif self.args.semi_random_crops_types == "cross":
-                    # 4 random cross shape crops (top-left, top-right, bottom-left, bottom-right)
-                    x_shift_random = [
-                        half_shift + (-1 if i % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
-                        for i in range(self.args.ue_num_crops - 1)
-                    ]
-                    y_shift_random = [
-                        half_shift + (-1 if i % 4 > 1 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
-                        for i in range(self.args.ue_num_crops - 1)
-                    ]
+            if self.args.ue_shift_crops_types in ['plus', 'cross', 'plus_cross']:
+                x_shift, y_shift = [], []
+                cur_crop_type = self.args.ue_shift_crops_types
 
+                for i in range(self.args.ue_num_crops - 1):
+                    # TODO for loop slow in inference, replace it
+                    # TODO add const or rand choice
+                    x_val = self.ue_rng.integers(MIN_SHIFT, half_shift)
+                    y_val = self.ue_rng.integers(MIN_SHIFT, half_shift)
 
-                elif self.args.semi_random_crops_types == "plus_cross":
-                    # 4 random plus + 4 random cross shape crops
-                    # TODO: Implement this case
-                    pass
+                    if cur_crop_type == "plus":
+                        # 4 random plus shape crops (up, left, down, right)
+                        x_shift.append(half_shift if i % 2 == 0 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * x_val)
+                        y_shift.append(half_shift if i % 2 == 1 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * y_val)
+                        if self.args.ue_shift_crops_types == 'plus_cross' and i % 8 == 3: 
+                            cur_crop_type = 'cross'
+
+                    elif cur_crop_type == "cross":
+                        # 4 random cross shape crops (top-left, top-right, bottom-left, bottom-right)
+                        x_shift.append(half_shift + (-1 if i % 2 == 0 else 1) * x_val)
+                        y_shift.append(half_shift + (-1 if i % 4 > 1 else 1) * y_val)
+                        if self.args.ue_shift_crops_types == 'plus_cross' and i % 8 == 7: 
+                            cur_crop_type = 'plus'
+
 
             elif self.args.ue_shift_crops_types == "random":
-                x_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
-                y_shift_random = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
+                x_shift = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
+                y_shift = [int(self.ue_rng.integers(0, resized_ue_shift)) for i in range(self.args.ue_num_crops - 1)]
 
-            w_random = [self.args.database_size_large - resized_ue_shift for i in range(self.args.ue_num_crops)]
-            x_shift = torch.tensor(x_center_shift + x_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
-            y_shift = torch.tensor(y_center_shift + y_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+            elif self.args.ue_shift_crops_types == 'grid':
+                # find root
+                grid_x_cells = math.isqrt(NUM_CROPS)
+                is_grid_odd = False
+                if grid_x_cells * grid_x_cells == NUM_CROPS and grid_x_cells % 2 == 1:  # k^2
+                    is_grid_odd = True
+                elif grid_x_cells * grid_x_cells != NUM_CROPS - 1 or grid_x_cells % 2 == 1:  # k^2 + 1
+                    raise ValueError(f"Invalid NUM_CROPS={NUM_CROPS}: expected k^2 for odd k ,or k^2 + 1 for even k")
+
+                x_shift = np.linspace((FRAME_SUB_CROP - resized_ue_shift) // 2, (FRAME_SUB_CROP + resized_ue_shift) // 2, grid_x_cells)
+                y_shift = np.linspace((FRAME_SUB_CROP - resized_ue_shift) // 2, (FRAME_SUB_CROP + resized_ue_shift) // 2, grid_x_cells)
+                x_shift, y_shift = np.meshgrid(x_shift, y_shift)
+                x_shift = list(x_shift.reshape(-1))
+                y_shift = list(y_shift.reshape(-1))
+                if is_grid_odd:  # remove centeral cell crop to avoid redundancy with main crop
+                    del x_shift[len(x_shift) // 2]
+                    del y_shift[len(y_shift) // 2]
+                
+
+            w_random = [CROP_WIDTH for i in range(self.args.ue_num_crops)]
+            x_shift = torch.tensor(x_center_shift + x_shift).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+            y_shift = torch.tensor(y_center_shift + y_shift).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
             w = torch.tensor(w_random, dtype=torch.float).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
 
         else:
@@ -811,37 +829,32 @@ class UASTHN():
                 y_shift = torch.tensor([0] + y_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
                 w = torch.tensor([self.args.resize_width] + w_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
 
-            elif self.args.ue_shift_crops_types == "semi_random":
-                half_shift = self.args.ue_shift // 2
-                MIN_SHIFT = min(half_shift - 1, 6)
-                MIN_SHIFT = min(half_shift - 1, 6)
+            elif self.args.ue_shift_crops_types in ['plus', 'cross', 'plus_cross']:
+                x_shift, y_shift = [], []
+                cur_crop_type = self.args.ue_shift_crops_types
 
-                if self.args.semi_random_crops_types == "plus":
-                # 4 random plus shape crops (up, left, down, right)
-                    x_shift_random = [
-                        half_shift if i % 2 == 0 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
-                        for i in range(self.args.ue_num_crops - 1)
-                    ]
-                    y_shift_random = [
-                        half_shift if i % 2 == 1 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
-                        for i in range(self.args.ue_num_crops - 1)
-                    ]
+                for i in range(self.args.ue_num_crops - 1):
+                    # TODO add const or rand choice
+                    x_val = self.ue_rng.integers(MIN_SHIFT, half_shift)
+                    y_val = self.ue_rng.integers(MIN_SHIFT, half_shift)
 
+                    if cur_crop_type == "plus":
+                        # 4 random plus shape crops (up, left, down, right)
+                        x_shift.append(half_shift if i % 2 == 0 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * x_val)
+                        y_shift.append(half_shift if i % 2 == 1 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * y_val)
+                        if self.args.ue_shift_crops_types == 'plus_cross' and i % 8 == 3: 
+                            cur_crop_type = 'cross'
 
-                elif self.args.semi_random_crops_types == "cross":
-                    # 4 random cross shape crops (top-left, top-right, bottom-left, bottom-right)
-                    x_shift_random = [
-                        half_shift + (-1 if i % 2 == 0 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
-                        for i in range(self.args.ue_num_crops - 1)
-                    ]
-                    y_shift_random = [
-                        half_shift + (-1 if i % 4 > 1 else 1) * int(self.ue_rng.integers(MIN_SHIFT, half_shift))
-                        for i in range(self.args.ue_num_crops - 1)
-                    ]
+                    elif cur_crop_type == "cross":
+                        # 4 random cross shape crops (top-left, top-right, bottom-left, bottom-right)
+                        x_shift.append(half_shift + (-1 if i % 2 == 0 else 1) * x_val)
+                        y_shift.append(half_shift + (-1 if i % 4 > 1 else 1) * y_val)
+                        if self.args.ue_shift_crops_types == 'plus_cross' and i % 8 == 7: 
+                            cur_crop_type = 'plus'
 
                 w_random = [self.args.resize_width - self.args.ue_shift for i in range(self.args.ue_num_crops - 1)]
-                x_shift = torch.tensor([0] + x_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
-                y_shift = torch.tensor([0] + y_shift_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+                x_shift = torch.tensor([0] + x_shift).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
+                y_shift = torch.tensor([0] + y_shift).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
                 w = torch.tensor([self.args.resize_width] + w_random, dtype=torch.float).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
 
             elif self.args.ue_shift_crops_types == "random_relax":

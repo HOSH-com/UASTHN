@@ -242,7 +242,6 @@ def _build_runtime_args(cli_args):
         args.ue_ensemble_load_models = None
 
     args.ue_aug_method = "shift"
-    args.semi_random_crops_types = cli_args.semi_random_crops_types
     args.crop_width = args.resize_width - cli_args.ue_shift  # 256 - 32 = 224
     args.ue_num_crops = cli_args.ue_num_crops if cli_args.enable_uncertainty else 1
     args.ue_shift_crops_types = cli_args.ue_shift_crops_types if cli_args.enable_uncertainty else "random"
@@ -1061,9 +1060,8 @@ Examples:
     parser.add_argument("--ue_shift", type=int, default=32,
                        help="Crop offset in pixels (o_c=32 from paper)")
     parser.add_argument("--ue_shift_crops_types", type=str, default="random",
-                       choices=["random", "grid", "semi_random","grid_center"],
+                       choices=["random", "grid", "plus", "cross", "plus_cross"],
                        help="Crop sampling method (random from paper)")
-    parser.add_argument("--semi_random_crops_types", type=str, default="plus", choices=["plus", "cross", "plus_cross"])
     parser.add_argument("--ue_std_method", type=str, default="all",
                        choices=["any", "all", "mean"],
                        help="Uncertainty aggregation method (all from paper)")
