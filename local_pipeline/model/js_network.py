@@ -117,9 +117,12 @@ class IHN(nn.Module):
 
     def forward(self, image1, image2, iters_lev0 = 6, iters_lev1=6, corr_level=2, corr_radius=4, early_stop=-1, coords1_disp=None):
         # image1 = 2 * (image1 / 255.0) - 1.0
-        # image2 = 2 * (image2 / 255.0) - 1.0
+        # image2 = 2 * (image2 / 255.0) - 1.
+
         stage = ""
         if self.first_stage:
+            # print('### img1', image1[0].shape, image1[0])
+            # print('### img2', image2[0].shape, image2[0])
             stage = "First Stage"
         else:
             stage = "Second Stage"
@@ -247,6 +250,10 @@ class IHN(nn.Module):
         self.global_timing.add_time(f'Update {stage}', sum_update)
         self.global_timing.add_time(f'DLT {stage}', sum_dlt)
 
+        # if self.first_stage:
+            # print('### fimg1[0]', fmap1[0].shape, fmap1[0])
+            # print('### fimg2[0]', fmap2[0].shape, fmap2[0])
+            # print('### four_point_disp[0]', four_point_disp[0].shape, four_point_disp[0])
         if self.ue_method == "single" and self.first_stage:
             return four_point_predictions, four_point_disp, four_point_ues
         else:
@@ -418,11 +425,8 @@ class UASTHN():
                 ue = self.std_four_pred_five_crops.view(self.std_four_pred_five_crops.shape[0], -1).mean(dim=1).item()
 
                 if self.args.ue_sec_trigger_range[0] <= ue <= self.args.ue_sec_trigger_range[1]:
-                    print('!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-
                     if ue_sec == "points":
-                        print("!!! ue", ue, self.std_four_pred_five_crops)
-                        # if 
+                        # print("!!! ue", ue, self.std_four_pred_five_crops)
                         self.four_preds_list_ue_sec, self.four_pred_ue_sec, self.std_four_pred_ue_sec = self.run_ue_sec_points()
 
             if self.ue_method == "augment":
@@ -488,7 +492,7 @@ class UASTHN():
         max_offset = grid_size - width
 
         # offsets = torch.zeros((n, 2), device=self.device)
-        if n > 1 and max_offset > 0:
+        if n > 1 and max_offset >= 0:
             if self.args.ue_sec_points_mode != "rand":
                 raise NotImplementedError(
                     f"ue_sec_points_mode='{self.args.ue_sec_points_mode}' is not implemented yet"
@@ -515,6 +519,10 @@ class UASTHN():
 
         img1_rep = (self.image_1.unsqueeze(1).repeat(1, n, 1, 1, 1).view(B_total * n, C, H, W))
         img2_rep = (self.image_2.unsqueeze(1).repeat(1, n, 1, 1, 1).view(B_total * n, C, H, W))
+        if self.args.custom == 'satcrop':
+            self.xrcs_before = self.xrcs_before.unsqueeze(1).repeat(1, n, 1, 1, 1).view(B_total * n, 2, 2, 2)
+        else:
+            self.xct_before = self.xct_before.unsqueeze(1).repeat(1, n, 1, 1, 1).view(B_total * n, 2, 2, 2)
 
         # Sample upper-left corner of each square bbox.
         # Shape: (n, 2), where [:, 0] = x and [:, 1] = y.
@@ -564,7 +572,7 @@ class UASTHN():
         self.args.check_step = -1
 
         try:
-            four_pred_list, four_pred = self.netG(
+            four_preds_list, four_pred = self.netG(
                 image1=img1_rep,
                 image2=img2_rep,
                 iters_lev0=self.args.iters_lev0,
@@ -575,6 +583,13 @@ class UASTHN():
             self.args.check_step = prev_check_step
 
 
+        alpha = self.args.database_size / self.args.resize_width
+        four_preds_list, _, _, _ = self.ue_aggregation(four_preds_list, alpha, False, self.args.check_step)
+        four_pred = four_preds_list[-1]
+
+        # print('@@@ self.four_pred\n', self.four_pred.shape, self.four_pred)
+        # print('@@@ four_pred\n' , four_pred.shape, four_pred)
+
         four_pred = four_pred.view(B, num_crops, n, 2, 2, 2)
 
         combined = four_pred.reshape(B, num_crops * n, 2, 2, 2)
@@ -584,7 +599,7 @@ class UASTHN():
         # print('@@@ self.four_pred\n', self.std_four_pred_five_crops, self.four_pred.shape, self.four_pred)
         # print('@@@ four_pred\n', std_four_pred, four_pred.shape, four_pred)
 
-        return four_pred_list, four_pred, std_four_pred
+        return four_preds_list, four_pred, std_four_pred
 
     def forward_neg(self, for_training=False):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
@@ -749,7 +764,8 @@ class UASTHN():
 
             if self.args.ue_shift_crops_types in ['plus', 'cross', 'plus_cross']:
                 x_shift, y_shift = [], []
-                cur_crop_type = self.args.ue_shift_crops_types
+                cur_crop_type = self.args.ue_shift_crops_types if self.args.ue_shift_crops_types != 'plus_cross' else 'plus'
+
 
                 for i in range(self.args.ue_num_crops - 1):
                     # TODO for loop slow in inference, replace it
@@ -757,18 +773,23 @@ class UASTHN():
                     x_val = self.ue_rng.integers(MIN_SHIFT, half_shift)
                     y_val = self.ue_rng.integers(MIN_SHIFT, half_shift)
 
+                    # print('$$$ forrrr', self.args.ue_shift_crops_types, 'but', cur_crop_type)
+
                     if cur_crop_type == "plus":
                         # 4 random plus shape crops (up, left, down, right)
                         x_shift.append(half_shift if i % 2 == 0 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * x_val)
                         y_shift.append(half_shift if i % 2 == 1 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * y_val)
-                        if self.args.ue_shift_crops_types == 'plus_cross' and i % 8 == 3: 
+
+                        if i % 8 == 3 and self.args.ue_shift_crops_types == 'plus_cross':
+                            # print('!!! yesssss')
                             cur_crop_type = 'cross'
 
                     elif cur_crop_type == "cross":
                         # 4 random cross shape crops (top-left, top-right, bottom-left, bottom-right)
                         x_shift.append(half_shift + (-1 if i % 2 == 0 else 1) * x_val)
                         y_shift.append(half_shift + (-1 if i % 4 > 1 else 1) * y_val)
-                        if self.args.ue_shift_crops_types == 'plus_cross' and i % 8 == 7: 
+                        if i % 8 == 7 and self.args.ue_shift_crops_types == 'plus_cross': 
+                            # print('@@@ yesssss')
                             cur_crop_type = 'plus'
 
 

@@ -827,7 +827,7 @@ def run_js_loop(cli_args):
                         std_four_pred_combined = four_pred_combined.std(0)
                         # print('!!! std_four_pred_combined', std_four_pred_combined.shape, std_four_pred_combined)
                         ue2_value = std_four_pred_combined.mean().item()
-                        print('!!! ue2_value', ue2_value, std_four_pred_combined)
+                        # print('!!! ue2_value', ue2_value, std_four_pred_combined)
 
                 # Store results
                 all_corners.append([
