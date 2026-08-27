@@ -18,13 +18,20 @@ import time
 
 def bilinear_sampler(img, coords, mode='bilinear', mask=False):
     """ Wrapper for grid_sample, uses pixel coordinates """
+    # img (b*crops*64*64, 1, 64/2^i, 64/2^i)
+    # coords (b*crops*64*64, 9, 9, 2) / 2^i
     H, W = img.shape[-2:]
     xgrid, ygrid = coords.split([1, 1], dim=-1)
-    xgrid = 2 * xgrid / (W - 1) - 1
+    # print('@@@ xgrid bef', xgrid.shape, xgrid)
+    # print('@@@ ygrid bef', ygrid.shape, ygrid)
+    xgrid = 2 * xgrid / (W - 1) - 1  # normalize indices for grid_sample function (-1,+1)
     ygrid = 2 * ygrid / (H - 1) - 1
+    # print('@@@ xgrid aft', xgrid.shape, xgrid)
+    # print('@@@ ygrid aft', ygrid.shape, ygrid)
 
-    grid = torch.cat([xgrid, ygrid], dim=-1)
-    img = F.grid_sample(img, grid, align_corners=True)
+    grid = torch.cat([xgrid, ygrid], dim=-1)  # b*crops*64*64, 9, 9, 2
+    # print('@@@ grid', grid.shape, grid)
+    img = F.grid_sample(img, grid, align_corners=True)  # b*crops*64*64, 1, 9, 9
 
     if mask:
         mask = (xgrid > -1) & (ygrid > -1) & (xgrid < 1) & (ygrid < 1)

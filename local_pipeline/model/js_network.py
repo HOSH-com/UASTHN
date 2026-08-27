@@ -115,7 +115,7 @@ class IHN(nn.Module):
 
         return coords0, coords1
 
-    def forward(self, image1, image2, iters_lev0 = 6, iters_lev1=6, corr_level=2, corr_radius=4, early_stop=-1, coords1_disp=None):
+    def forward(self, image1, image2, iters_lev0 = 6, iters_lev1=6, corr_level=2, corr_radius=4, early_stop=-1, four_point_disp_init_64=None):
         # image1 = 2 * (image1 / 255.0) - 1.0
         # image2 = 2 * (image2 / 255.0) - 1.
 
@@ -156,22 +156,28 @@ class IHN(nn.Module):
         self. global_timing.start(f"CorrBlock Initialazation {stage}")
         # print(fmap1.shape, fmap2.shape)
         corr_fn = CorrBlock(fmap1, fmap2, num_levels=corr_level, radius=corr_radius)
+        # print('### corr_pyramid', len(corr_fn.corr_pyramid))
+        # for i in range(len(corr_fn.corr_pyramid)):
+        #     print(f'@@@ corr_fn.corr_pyramid[{i}]', corr_fn.corr_pyramid[i].shape, corr_fn.corr_pyramid[i])
 
+        sz = fmap1_64.shape
+        self.sz = sz
         coords0, coords1 = self.initialize_flow_4(image1)
+        four_point_disp = torch.zeros((sz[0], 2, 2, 2)).to(fmap1.device)
         # print(coords1.shape)
-        if coords1_disp is not None:
+        # print('### coords1 bef\n', coords1.shape, coords1)
+        if four_point_disp_init_64 is not None:
             # Global translation applied to the whole quarter-resolution grid,
             # used by the 'ue_sec points' secondary uncertainty pass to start
             # the iterative refinement from an offset location instead of the
             # identity (coords0 == coords1) initialization.
-            # print('### coords1 bef\n', coords1.shape, coords1)
-            # print('### coords1_disp\n', coords1_disp.shape, coords1_disp)
-            # coords1 = coords1 + coords1_disp.to(coords1.device).view(coords1.shape[0], 2, 1, 1)
-            coords1_disp_mul4 = coords1_disp * 4
-            sz = fmap1_64.shape
-            self.sz = sz
-            coords1 = self.get_flow_now_4(coords1_disp_mul4)
-            # print('### coords1 aft\n', coords1.shape, coords1)
+            # coords1 = coords1 + four_point_disp_init_64.to(coords1.device).view(coords1.shape[0], 2, 1, 1)
+            # print('### four_point_disp_init_64\n', four_point_disp_init_64.shape, four_point_disp_init_64)
+            four_point_disp = four_point_disp_init_64 * 4
+            coords1 = self.get_flow_now_4(four_point_disp)
+        
+        # print('### coords1 aft\n', coords1.shape, coords1)
+
 
         if self.args.check_step != -1 and self.first_stage and self.ue_method == "augment":
             B, C, H, W = fmap1.shape
@@ -179,9 +185,6 @@ class IHN(nn.Module):
             coords0_early = coords0.view(coords0.shape[0]//self.args.ue_num_crops, self.args.ue_num_crops, coords0.shape[1], coords0.shape[2], coords0.shape[3])[:,0]
         self. global_timing.end(f"CorrBlock Initialazation {stage}")
         # print(coords0.shape, coords1.shape)
-        sz = fmap1_64.shape
-        self.sz = sz
-        four_point_disp = torch.zeros((sz[0], 2, 2, 2)).to(fmap1.device)
         four_point_predictions = []
         if self.ue_method == "single" and self.first_stage:
             four_point_ues = []
@@ -192,6 +195,8 @@ class IHN(nn.Module):
         sum_dlt = 0.0
         # self.global_timing.start(f"for {stage}")
         for itr in range(iters_lev0):
+            # if itr == 2: exit()
+            # print('\n###', itr, '###\n')
             start_time = time.perf_counter()
             if (self.first_stage and (self.args.check_step == -1 or itr <= self.args.check_step)) or not self.first_stage:
                 corr = corr_fn(coords1)
@@ -204,6 +209,8 @@ class IHN(nn.Module):
                 flow = coords1 - coords0
             sum_corr += time.perf_counter() - start_time
             # print(corr.shape, flow.shape)
+            # print('### flow[0]', flow[0].shape, flow[0])
+            # print('### corr[0]', corr[0].shape, corr[0])
             with autocast(device_type='cuda', enabled=self.args.mixed_precision):
                 start_time = time.perf_counter()
                 if self.args.weight:
@@ -218,7 +225,11 @@ class IHN(nn.Module):
                 start_time = time.perf_counter()
                 last_four_point_disp = four_point_disp
                 four_point_disp =  four_point_disp + delta_four_point
+                # print('### delta_four_point', delta_four_point.shape, delta_four_point)
+                # print('### four_point_disp', four_point_disp.shape, four_point_disp)
+                # print('### coords1 bef', coords1.shape, coords1)
                 coords1 = self.get_flow_now_4(four_point_disp) # Possible error: Unsolvable H
+                # print('### coords1 aft', coords1.shape, coords1)
                 four_point_predictions.append(four_point_disp)
                 sum_dlt += time.perf_counter() - start_time
 
@@ -266,6 +277,7 @@ arch_list = {"IHN": IHN,
 class UASTHN():
     def __init__(self, args, for_training=False):
         super().__init__()
+        self.count = 0
         self.args = args
         self.global_timing = TimingTracker()
         self.ue_method = args.ue_method
@@ -371,6 +383,7 @@ class UASTHN():
 
     def forward(self, for_training=False, for_test=False):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
+        self.count += 1
 
         # time1 = time.time()
         # --- Generate Crops & Augment ---
@@ -492,13 +505,13 @@ class UASTHN():
         max_offset = grid_size - width
 
         # offsets = torch.zeros((n, 2), device=self.device)
-        if n > 1 and max_offset >= 0:
+        if n >= 1 and max_offset >= 0:
             if self.args.ue_sec_points_mode != "rand":
                 raise NotImplementedError(
                     f"ue_sec_points_mode='{self.args.ue_sec_points_mode}' is not implemented yet"
                 )
             # offsets[1:] = (torch.rand((n - 1, 2), device=self.device) * 2 - 1) * max_offset
-            offsets = torch.tensor(self.ue_rng.integers(0, max_offset + 1, size=(n, 2)), device=self.device)
+            offsets = torch.tensor(self.ue_rng.integers(0, max_offset + 1, size=(n, 2)), device=self.device)  # TODO use float
         return offsets
 
     def run_ue_sec_points(self):
@@ -548,7 +561,8 @@ class UASTHN():
         dx = offsets_single[:, 0]
         dy = offsets_single[:, 1]
 
-        corner_disp = torch.zeros((n, 2, 2, 2), device=offsets_single.device, dtype=offsets_single.dtype,)
+        # corner_disp = torch.zeros((n, 2, 2, 2), device=offsets_single.device, dtype=offsets_single.dtype,)
+        corner_disp = torch.zeros((n, 2, 2, 2), device=offsets_single.device, dtype=torch.float32)
 
         # x displacement
         corner_disp[:, 0, 0, 0] = dx
@@ -561,6 +575,18 @@ class UASTHN():
         corner_disp[:, 1, 0, 1] = dy
         corner_disp[:, 1, 1, 0] = dy + width - frame
         corner_disp[:, 1, 1, 1] = dy + width - frame
+
+        # # x displacement
+        # corner_disp[:, 0, 0, 0] = 40.71875
+        # corner_disp[:, 0, 0, 1] = -133
+        # corner_disp[:, 0, 1, 0] = 41.03125
+        # corner_disp[:, 0, 1, 1] = -134.625
+
+        # # y displacement
+        # corner_disp[:, 1, 0, 0] = 10.8125
+        # corner_disp[:, 1, 0, 1] = 11.328125
+        # corner_disp[:, 1, 1, 0] = -163.5
+        # corner_disp[:, 1, 1, 1] = -163.875
 
         # Repeat the same n offsets for every image/crop in the batch.
         # Final shape: (B_total * n, 2, 2, 2)
@@ -577,7 +603,7 @@ class UASTHN():
                 image2=img2_rep,
                 iters_lev0=self.args.iters_lev0,
                 corr_level=self.args.corr_level,
-                coords1_disp=start_points_disp,
+                four_point_disp_init_64=start_points_disp,
             )
         finally:
             self.args.check_step = prev_check_step

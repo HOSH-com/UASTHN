@@ -19,11 +19,11 @@ class CorrBlock:
 
         corr = CorrBlock.corr(fmap1, fmap2)
         batch, h1, w1, dim, h2, w2 = corr.shape
-        corr = corr.reshape(batch * h1 * w1, dim, h2, w2)
+        corr = corr.reshape(batch * h1 * w1, dim, h2, w2)  # b*crops*64*64, 1, 64, 64
 
         self.corr_pyramid.append(corr)
         for i in range(self.num_levels - 1):
-            corr = F.avg_pool2d(corr, 2, stride=2)
+            corr = F.avg_pool2d(corr, 2, stride=2)  # b*crops*64*64, 1, 64/2^i, 64/2^i
             self.corr_pyramid.append(corr)
 
         r = radius
@@ -32,21 +32,30 @@ class CorrBlock:
         self.delta = torch.stack(torch.meshgrid(dy, dx), axis=-1).to(fmap1.device)
 
     def __call__(self, coords):
-        r = self.radius
-        coords = coords.permute(0, 2, 3, 1)
+        r = self.radius  # 4
+        coords = coords.permute(0, 2, 3, 1)  # b*crops, 64, 64, 2
         batch, h1, w1, _ = coords.shape
 
         out_pyramid = []
-        for i in range(self.num_levels):
-            corr = self.corr_pyramid[i]
-            delta = self.delta
-            
-            centroid_lvl = coords.reshape(batch * h1 * w1, 1, 1, 2) / 2 ** i
-            delta_lvl = delta.view(1, 2 * r + 1, 2 * r + 1, 2)
-            coords_lvl = centroid_lvl + delta_lvl
+        for i in range(self.num_levels):  # 4
+            # print('@@@@@@@@', i, '@@@@@@@@')
+            corr = self.corr_pyramid[i]  # b*crops*64*64, 1, 64/2^i, 64/2^i
+            delta = self.delta  # 9, 9, 2
 
-            corr = bilinear_sampler(corr, coords_lvl)
-            corr = corr.view(batch, h1, w1, -1)
+            centroid_lvl = coords.reshape(batch * h1 * w1, 1, 1, 2) / 2 ** i  # b*crops*64*64, 1, 1, 2
+            delta_lvl = delta.view(1, 2 * r + 1, 2 * r + 1, 2)  # 1, 9, 9, 2
+            coords_lvl = centroid_lvl + delta_lvl  # b*crops*64*64, 9, 9, 2
+
+            # print('@@@ delta', delta.shape, delta)
+            # print('@@@ delta_lvl', delta_lvl.shape, delta_lvl)
+            # print('@@@ coords', coords.shape, coords)
+            # print('@@@ centroid_lvl', centroid_lvl.shape, centroid_lvl)
+            # print('@@@ coords_lvl', coords_lvl.shape, coords_lvl)
+
+            # print('@@@ corr bef', corr.shape, corr)
+            corr = bilinear_sampler(corr, coords_lvl)  # b*crops*64*64, 1, 9, 9
+            # print('@@@ corr aft', corr.shape, corr)
+            corr = corr.view(batch, h1, w1, -1)  # b*crops, 64, 64, 9*9
             out_pyramid.append(corr)
 
         out = torch.cat(out_pyramid, dim=-1)

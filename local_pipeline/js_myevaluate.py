@@ -670,6 +670,14 @@ def run_js_loop(cli_args):
                 f'x3_c{crop_i}', f'y3_c{crop_i}',
                 f'x4_c{crop_i}', f'y4_c{crop_i}',
             ])
+    for crop_i in range(1, args.ue_num_crops):
+        for iter_i in range(1, args.iters_lev0 + 1):
+            crop_cols.extend([
+                    f'x1_c{crop_i}_i{iter_i}', f'y1_c{crop_i}_i{iter_i}',
+                    f'x2_c{crop_i}_i{iter_i}', f'y2_c{crop_i}_i{iter_i}',
+                    f'x3_c{crop_i}_i{iter_i}', f'y3_c{crop_i}_i{iter_i}',
+                    f'x4_c{crop_i}_i{iter_i}', f'y4_c{crop_i}_i{iter_i}',
+                ])
 
     # Secondary uncertainty pass columns (--ue_sec points): corners for the
     # (n - 1) random-offset starts of the primary (crop index 0) CropTTA crop
@@ -679,6 +687,7 @@ def run_js_loop(cli_args):
     # `ue_num_crops * ue_sec_points_n` predictions for that tile.
     sec_cols = []
     if args.ue_sec == "points":
+        # print('!!! args.ue_num_crops * (args.ue_sec_points_n - 1)', args.ue_num_crops * (args.ue_sec_points_n - 1))
         for i in range(args.ue_num_crops * (args.ue_sec_points_n - 1)):
             sec_i = i + 1
             sec_cols.extend([
@@ -687,6 +696,16 @@ def run_js_loop(cli_args):
                 f'x3_s{sec_i}', f'y3_s{sec_i}',
                 f'x4_s{sec_i}', f'y4_s{sec_i}',
             ])
+
+        for i in range(args.ue_num_crops * (args.ue_sec_points_n - 1)):
+            for iter_i in range(1, args.iters_lev0 + 1):
+                sec_i = i + 1
+                sec_cols.extend([
+                    f'x1_s{sec_i}_i{iter_i}', f'y1_s{sec_i}_i{iter_i}',
+                    f'x2_s{sec_i}_i{iter_i}', f'y2_s{sec_i}_i{iter_i}',
+                    f'x3_s{sec_i}_i{iter_i}', f'y3_s{sec_i}_i{iter_i}',
+                    f'x4_s{sec_i}_i{iter_i}', f'y4_s{sec_i}_i{iter_i}',
+                ])
 
     n_fallback_pad = len(iter_cols) + len(crop_cols) + len(sec_cols)
 
@@ -796,9 +815,16 @@ def run_js_loop(cli_args):
                     crop_points = four_point_crop.squeeze(0).cpu().tolist()
                     crop_vals.extend([coord for point in crop_points for coord in point])
 
+                for crop_i in range(1, args.ue_num_crops):
+                        for iter_i in range(args.iters_lev0):
+                            four_point_crop = model.four_preds_list[iter_i][crop_i] + four_point_resized_satellite
+                            four_point_crop = four_point_crop.flatten(2).permute(0, 2, 1).contiguous()
+                            four_point_crop = four_point_crop * scale
+                            crop_points = four_point_crop.squeeze(0).cpu().tolist()
+                            crop_vals.extend([coord for point in crop_points for coord in point])
+
                 # Secondary uncertainty pass ('--ue_sec points'): combines
                 # ue_num_crops * ue_sec_points_n predictions per tile.
-                sec_vals = [np.nan] * len(sec_cols)
                 ue2_value = np.nan
                 if args.ue_sec == "points" and hasattr(model, "four_pred_ue_sec"):
                     four_pred_sec = model.four_pred_ue_sec.view(-1, args.ue_num_crops * (args.ue_sec_points_n - 1), 2, 2, 2)  # (1, ue_num_crops*(n-1), 2, 2, 2)
@@ -828,6 +854,16 @@ def run_js_loop(cli_args):
                         # print('!!! std_four_pred_combined', std_four_pred_combined.shape, std_four_pred_combined)
                         ue2_value = std_four_pred_combined.mean().item()
                         # print('!!! ue2_value', ue2_value, std_four_pred_combined)
+
+                    # print('!!! for', model.four_preds_list_ue_sec[0].shape[0], '*', args.iters_lev0)
+                    for sec_i in range(model.four_preds_list_ue_sec[0].shape[0]):
+                        for iter_i in range(args.iters_lev0):
+                            four_pred_sec = model.four_preds_list_ue_sec[iter_i][sec_i]  # (1, 2, 2, 2)
+                            four_point_sec_abs = four_pred_sec + four_point_resized_satellite
+                            four_point_sec_abs = four_point_sec_abs.flatten(2).permute(0, 2, 1).contiguous()
+                            four_point_sec_abs = four_point_sec_abs * scale
+                            pt_set = four_point_sec_abs.squeeze(0).cpu().tolist()  # (n, 4, 2)
+                            sec_vals.extend([coord for point in pt_set for coord in point])
 
                 # Store results
                 all_corners.append([
