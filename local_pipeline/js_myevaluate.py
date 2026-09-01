@@ -826,6 +826,8 @@ def run_js_loop(cli_args):
                 # Secondary uncertainty pass ('--ue_sec points'): combines
                 # ue_num_crops * ue_sec_points_n predictions per tile.
                 ue2_value = np.nan
+                sec_vals = []
+
                 if args.ue_sec == "points" and hasattr(model, "four_pred_ue_sec"):
                     four_pred_sec = model.four_pred_ue_sec.view(-1, args.ue_num_crops * (args.ue_sec_points_n - 1), 2, 2, 2)  # (1, ue_num_crops*(n-1), 2, 2, 2)
 
@@ -838,7 +840,6 @@ def run_js_loop(cli_args):
                     four_point_sec_abs = four_point_sec_abs * scale
                     sec_points_per_n = four_point_sec_abs.squeeze(0).cpu().tolist()  # (n, 4, 2)
 
-                    sec_vals = []
                     for sec_i in range(len(sec_points_per_n)):
                         pt_set = sec_points_per_n[sec_i]
                         sec_vals.extend([coord for point in pt_set for coord in point])
