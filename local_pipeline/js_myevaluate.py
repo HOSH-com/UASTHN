@@ -12,6 +12,7 @@ Enhanced features:
 """
 
 import argparse
+import math
 import os
 import time
 import sys
@@ -34,6 +35,51 @@ from utils import ResourceMonitor
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _secondary_prediction_count(args):
+    if args.ue_sec == "points":
+        return args.ue_num_crops * (args.ue_sec_points_n - 1)
+    if args.ue_sec == "crops":
+        return args.ue_sec_crops_n
+    return 0
+
+
+def _secondary_columns(args):
+    columns = []
+    for sec_i in range(1, _secondary_prediction_count(args) + 1):
+        columns.extend([
+            f"x1_s{sec_i}", f"y1_s{sec_i}",
+            f"x2_s{sec_i}", f"y2_s{sec_i}",
+            f"x3_s{sec_i}", f"y3_s{sec_i}",
+            f"x4_s{sec_i}", f"y4_s{sec_i}",
+        ])
+    for sec_i in range(1, _secondary_prediction_count(args) + 1):
+        for iter_i in range(1, args.iters_lev0 + 1):
+            columns.extend([
+                f"x1_s{sec_i}_i{iter_i}", f"y1_s{sec_i}_i{iter_i}",
+                f"x2_s{sec_i}_i{iter_i}", f"y2_s{sec_i}_i{iter_i}",
+                f"x3_s{sec_i}_i{iter_i}", f"y3_s{sec_i}_i{iter_i}",
+                f"x4_s{sec_i}_i{iter_i}", f"y4_s{sec_i}_i{iter_i}",
+            ])
+    return columns
+
+
+def _validate_cli_args(args, parser):
+    if args.ue_sec != "none" and not args.enable_uncertainty:
+        parser.error("--ue_sec requires --enable_uncertainty")
+    if args.ue_sec_trigger_range[0] > args.ue_sec_trigger_range[1]:
+        parser.error("--ue_sec_trigger_range MIN must not exceed MAX")
+    if args.ue_sec == "crops":
+        if args.custom != "satcrop":
+            parser.error("--ue_sec crops currently requires --custom satcrop")
+        if args.ue_sec_crops_n < 1:
+            parser.error("--ue_sec_crops_n must be at least 1")
+        if args.ue_num_crops < 3:
+            parser.error("--ue_sec crops requires --ue_num_crops of at least 3")
+    if args.ue_sec == "points" and args.ue_sec_points_n < 2:
+        parser.error("--ue_sec_points_n must be at least 2")
+    return args
 
 
 # ============================================================
@@ -679,33 +725,9 @@ def run_js_loop(cli_args):
                     f'x4_c{crop_i}_i{iter_i}', f'y4_c{crop_i}_i{iter_i}',
                 ])
 
-    # Secondary uncertainty pass columns (--ue_sec points): corners for the
-    # (n - 1) random-offset starts of the primary (crop index 0) CropTTA crop
-    # (index 0 duplicates the primary x1..y4 columns, so it's skipped,
-    # matching the crop_cols convention). The 'ue2' scalar column (added
-    # below, per row) separately aggregates uncertainty across *all*
-    # `ue_num_crops * ue_sec_points_n` predictions for that tile.
-    sec_cols = []
-    if args.ue_sec == "points":
-        # print('!!! args.ue_num_crops * (args.ue_sec_points_n - 1)', args.ue_num_crops * (args.ue_sec_points_n - 1))
-        for i in range(args.ue_num_crops * (args.ue_sec_points_n - 1)):
-            sec_i = i + 1
-            sec_cols.extend([
-                f'x1_s{sec_i}', f'y1_s{sec_i}',
-                f'x2_s{sec_i}', f'y2_s{sec_i}',
-                f'x3_s{sec_i}', f'y3_s{sec_i}',
-                f'x4_s{sec_i}', f'y4_s{sec_i}',
-            ])
-
-        for i in range(args.ue_num_crops * (args.ue_sec_points_n - 1)):
-            for iter_i in range(1, args.iters_lev0 + 1):
-                sec_i = i + 1
-                sec_cols.extend([
-                    f'x1_s{sec_i}_i{iter_i}', f'y1_s{sec_i}_i{iter_i}',
-                    f'x2_s{sec_i}_i{iter_i}', f'y2_s{sec_i}_i{iter_i}',
-                    f'x3_s{sec_i}_i{iter_i}', f'y3_s{sec_i}_i{iter_i}',
-                    f'x4_s{sec_i}_i{iter_i}', f'y4_s{sec_i}_i{iter_i}',
-                ])
+    # Secondary uncertainty columns use the same _sN schema for point starts
+    # and additional crops so downstream plotting can discover either mode.
+    sec_cols = _secondary_columns(args)
 
     n_fallback_pad = len(iter_cols) + len(crop_cols) + len(sec_cols)
 
@@ -735,6 +757,9 @@ def run_js_loop(cli_args):
         iterator = tqdm(loop_iter, desc="Inference", unit="img")
     else:
         iterator = loop_iter
+
+    # Log at most 20 evenly spaced progress records across the full run.
+    progress_log_interval = max(1, math.ceil(cli_args.num_samples / 20))
 
     # Track inference start time for overall performance
     inference_start_time = time.perf_counter()
@@ -823,48 +848,33 @@ def run_js_loop(cli_args):
                             crop_points = four_point_crop.squeeze(0).cpu().tolist()
                             crop_vals.extend([coord for point in crop_points for coord in point])
 
-                # Secondary uncertainty pass ('--ue_sec points'): combines
-                # ue_num_crops * ue_sec_points_n predictions per tile.
+                # Secondary predictions share the _sN output schema. ue2 is
+                # calculated by the model from the appropriate pool for each mode.
                 ue2_value = np.nan
-                sec_vals = []
+                sec_vals = [np.nan] * len(sec_cols)
 
-                if args.ue_sec == "points" and hasattr(model, "four_pred_ue_sec"):
-                    four_pred_sec = model.four_pred_ue_sec.view(-1, args.ue_num_crops * (args.ue_sec_points_n - 1), 2, 2, 2)  # (1, ue_num_crops*(n-1), 2, 2, 2)
-
-                    # Corner columns: only the primary (crop index 0) crop's
-                    # (n - 1) random-offset predictions, to keep column count sane.
+                if args.ue_sec != "none" and model.four_pred_ue_sec is not None:
+                    secondary_count = _secondary_prediction_count(args)
+                    four_pred_sec = model.four_pred_ue_sec.reshape(
+                        1, secondary_count, 2, 2, 2
+                    )
                     four_point_sec_abs = four_pred_sec + four_point_resized_satellite.unsqueeze(1)
-                    # print('$$$ four_pred_sec', four_pred_sec.shape, four_pred_sec)
-                    # print('$$$ four_point_sec_abs', four_point_sec_abs.shape, four_point_sec_abs)
                     four_point_sec_abs = four_point_sec_abs.flatten(3).permute(0, 1, 3, 2).contiguous()
                     four_point_sec_abs = four_point_sec_abs * scale
-                    sec_points_per_n = four_point_sec_abs.squeeze(0).cpu().tolist()  # (n, 4, 2)
+                    output_values = []
+                    for point_set in four_point_sec_abs.squeeze(0).cpu().tolist():
+                        output_values.extend([coord for point in point_set for coord in point])
 
-                    for sec_i in range(len(sec_points_per_n)):
-                        pt_set = sec_points_per_n[sec_i]
-                        sec_vals.extend([coord for point in pt_set for coord in point])
-
-                    # 'ue2': uncertainty aggregated across ue_num_crops *
-                    # ue_sec_points_n predictions for this single tile.
-                    if hasattr(model, "std_four_pred_ue_sec"):
-                        # print('!!! model.model.four_preds_list[-1]', model.four_preds_list[-1].shape, model.four_preds_list[-1])
-                        # print('!!! four_pred_sec.squeeze()', four_pred_sec.squeeze().shape, four_pred_sec.squeeze())
-                        four_pred_combined = torch.cat([four_pred_sec.squeeze(), model.four_preds_list[-1]], dim=0)
-                        # print('!!! four_pred_combined', four_pred_combined.shape, four_pred_combined)
-                        std_four_pred_combined = four_pred_combined.std(0)
-                        # print('!!! std_four_pred_combined', std_four_pred_combined.shape, std_four_pred_combined)
-                        ue2_value = std_four_pred_combined.mean().item()
-                        # print('!!! ue2_value', ue2_value, std_four_pred_combined)
-
-                    # print('!!! for', model.four_preds_list_ue_sec[0].shape[0], '*', args.iters_lev0)
-                    for sec_i in range(model.four_preds_list_ue_sec[0].shape[0]):
+                    ue2_value = model.std_four_pred_ue_sec.mean().item()
+                    for sec_i in range(secondary_count):
                         for iter_i in range(args.iters_lev0):
-                            four_pred_sec = model.four_preds_list_ue_sec[iter_i][sec_i]  # (1, 2, 2, 2)
-                            four_point_sec_abs = four_pred_sec + four_point_resized_satellite
+                            four_pred_sec_iter = model.four_preds_list_ue_sec[iter_i][sec_i]
+                            four_point_sec_abs = four_pred_sec_iter + four_point_resized_satellite
                             four_point_sec_abs = four_point_sec_abs.flatten(2).permute(0, 2, 1).contiguous()
                             four_point_sec_abs = four_point_sec_abs * scale
-                            pt_set = four_point_sec_abs.squeeze(0).cpu().tolist()  # (n, 4, 2)
-                            sec_vals.extend([coord for point in pt_set for coord in point])
+                            point_set = four_point_sec_abs.squeeze(0).cpu().tolist()
+                            output_values.extend([coord for point in point_set for coord in point])
+                    sec_vals = output_values
 
                 # Store results
                 all_corners.append([
@@ -891,7 +901,7 @@ def run_js_loop(cli_args):
                 ])
                 successful_count += 1
 
-                if i % 10 == 0 or i == 0:
+                if i % progress_log_interval == 0:
                     center_x = (flat_points[0] + flat_points[2] + flat_points[4] + flat_points[6]) / 4
                     center_y = (flat_points[1] + flat_points[3] + flat_points[5] + flat_points[7]) / 4
                     status = "OK" if is_accepted else "REJ"
@@ -990,7 +1000,7 @@ def run_js_loop(cli_args):
         "th",                # 13 (now integer)
         "ue",                  # 14
         "acc",          # 15
-        "ue2",          # 16: uncertainty across ue_num_crops * ue_sec_points_n
+        "ue2",          # 16: secondary uncertainty
         *iter_cols,
         *crop_cols,
         *sec_cols
@@ -1120,10 +1130,11 @@ Examples:
     # Second UE
     parser.add_argument("--ue_sec",type=str,default="none", choices=["none","crops","points"])
     parser.add_argument("--ue_sec_trigger_range", type=float, nargs=2, default=[4.0, 10.0], metavar=("MIN", "MAX"),)
-    parser.add_argument("--ue_sec_crops_n",type=int,default=4)
+    parser.add_argument("--ue_sec_crops_n", type=int, default=4,
+                       help="Number of additional random crops after removing one LOO outlier")
     parser.add_argument("--ue_sec_points_n",type=int,default=4)
     parser.add_argument("--ue_sec_points_width",type=int,choices=range(40,65),default=48)
-    parser.add_argument("--ue_sec_crops_mode",type=str,default="none") # TODO
+    parser.add_argument("--ue_sec_crops_mode", type=str, default="random", choices=["random"])
     parser.add_argument("--ue_sec_points_mode",type=str,default="rand",choices=["rand","grid","guided"]) # TODO
     # parser.add_argument(--ue)
 
@@ -1136,7 +1147,7 @@ Examples:
                        help="Set torch CPU threads; 0 keeps default")
 
 
-    return parser.parse_args()
+    return _validate_cli_args(parser.parse_args(), parser)
 
 
 if __name__ == "__main__":

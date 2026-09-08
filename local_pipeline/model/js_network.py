@@ -23,6 +23,11 @@ from model.js_kornia_replacement import (
     get_perspective_transform_torch,
     crop_and_resize_torch,
 )
+from ue_secondary import (
+    combined_uncertainty,
+    loo_keep_indices,
+    sample_unique_crop_origins,
+)
 
 autocast = torch.amp.autocast
 
@@ -423,24 +428,24 @@ class UASTHN():
             if self.ue_method != "single":
                 self.four_preds_list, self.four_pred = self.first_stage_ue_aggregation(self.four_preds_list, for_training)
 
-            # --- Secondary uncertainty pass: random-offset starting points ---
-            # Must run *before* self.image_1/self.image_2 get sliced back down
-            # below, so it sees all `ue_num_crops` CropTTA crop variations
-            # combined with the `ue_sec_points_n` random-offset starts
-            # (ue_num_crops * ue_sec_points_n predictions per tile).
+            # Run a secondary coarse pass before reducing the CropTTA batch.
             ue_sec = getattr(self.args, "ue_sec", "none")
-            self.four_preds_list_ue_sec, self.four_pred_ue_sec, self.std_four_pred_ue_sec = None, None, None
-            if ue_sec is not 'none' and self.ue_method != "ensemble":
-                # TODO IMPLEMENT FOR BATCH GREATER THAN 1 
-
+            self.four_preds_list_ue_sec = None
+            self.four_pred_ue_sec = None
+            self.std_four_pred_ue_sec = None
+            self.ue_sec_primary_keep_indices = None
+            if ue_sec != "none" and self.ue_method != "ensemble":
                 if self.std_four_pred_five_crops.shape[0] != 1:
                     raise NotImplementedError("Only batch size 1 is supported for ue_sec!")
-                ue = self.std_four_pred_five_crops.view(self.std_four_pred_five_crops.shape[0], -1).mean(dim=1).item()
+                ue = self.std_four_pred_five_crops.reshape(
+                    self.std_four_pred_five_crops.shape[0], -1
+                ).mean(dim=1).item()
 
                 if self.args.ue_sec_trigger_range[0] <= ue <= self.args.ue_sec_trigger_range[1]:
                     if ue_sec == "points":
-                        # print("!!! ue", ue, self.std_four_pred_five_crops)
                         self.four_preds_list_ue_sec, self.four_pred_ue_sec, self.std_four_pred_ue_sec = self.run_ue_sec_points()
+                    elif ue_sec == "crops":
+                        self.four_preds_list_ue_sec, self.four_pred_ue_sec, self.std_four_pred_ue_sec = self.run_ue_sec_crops()
 
             if self.ue_method == "augment":
                 B5, C, H, W = self.image_2.shape
@@ -619,13 +624,91 @@ class UASTHN():
         four_pred = four_pred.view(B, num_crops, n, 2, 2, 2)
 
         combined = four_pred.reshape(B, num_crops * n, 2, 2, 2)
-
-        std_four_pred = torch.std(combined, dim=1)  # (B, 2, 2, 2)
-
-        # print('@@@ self.four_pred\n', self.std_four_pred_five_crops, self.four_pred.shape, self.four_pred)
-        # print('@@@ four_pred\n', std_four_pred, four_pred.shape, four_pred)
+        primary_predictions = self.four_preds_list[-1].reshape(
+            B, num_crops, 2, 2, 2
+        )
+        std_four_pred = combined_uncertainty(primary_predictions, combined)
 
         return four_preds_list, four_pred, std_four_pred
+
+    def run_ue_sec_crops(self):
+        """Run K additional random SatCrop predictions after LOO filtering."""
+        if self.args.custom != "satcrop":
+            raise NotImplementedError("--ue_sec crops currently supports only --custom satcrop")
+        if self.args.ue_sec_crops_mode != "random":
+            raise NotImplementedError(
+                f"ue_sec_crops_mode='{self.args.ue_sec_crops_mode}' is not implemented"
+            )
+
+        num_crops = self.args.ue_num_crops
+        secondary_count = self.args.ue_sec_crops_n
+        B_total, C, H, W = self.image_2.shape
+        B = B_total // num_crops
+        if B != 1:
+            raise NotImplementedError("Only batch size 1 is supported for ue_sec crops")
+
+        alpha = self.args.database_size / self.args.resize_width
+        primary_xrcs = self.xrcs_before.detach()
+        primary_origins = primary_xrcs[:, :, 0, 0] * alpha
+        excluded = {
+            (int(round(origin[0].item())), int(round(origin[1].item())))
+            for origin in primary_origins
+        }
+        max_offset = self.args.database_size_large - self.args.database_size
+        origins = sample_unique_crop_origins(
+            self.ue_rng, secondary_count, max_offset, excluded=excluded
+        )
+        x_start = torch.as_tensor(origins[:, 0], device=self.device, dtype=torch.float32)
+        y_start = torch.as_tensor(origins[:, 1], device=self.device, dtype=torch.float32)
+        widths = torch.full(
+            (secondary_count,), self.args.database_size, device=self.device, dtype=torch.float32
+        )
+        crop_boxes = bbox.bbox_generator(x_start, y_start, widths, widths)
+        crop_boxes_swap = torch.stack(
+            [crop_boxes[:, 0], crop_boxes[:, 1], crop_boxes[:, 3], crop_boxes[:, 2]], dim=1
+        )
+        secondary_xrcs = (
+            (crop_boxes_swap / alpha)
+            .permute(0, 2, 1)
+            .reshape(secondary_count, 2, 2, 2)
+            .contiguous()
+        )
+
+        source_images = self.image_1_ori.repeat_interleave(secondary_count, dim=0)
+        image1 = tgm.crop_and_resize(
+            source_images, crop_boxes, (self.args.resize_width, self.args.resize_width)
+        )
+        primary_image2 = self.image_2.reshape(B, num_crops, C, H, W)[:, 0]
+        image2 = primary_image2.repeat_interleave(secondary_count, dim=0)
+
+        prev_check_step = self.args.check_step
+        self.args.check_step = -1
+        try:
+            raw_predictions, _ = self.netG(
+                image1=image1,
+                image2=image2,
+                iters_lev0=self.args.iters_lev0,
+                corr_level=self.args.corr_level,
+            )
+        finally:
+            self.args.check_step = prev_check_step
+
+        frame_corners = self.four_point_org_xrs_single.repeat(secondary_count, 1, 1, 1)
+        recovered_predictions = [
+            prediction + secondary_xrcs - frame_corners for prediction in raw_predictions
+        ]
+        secondary_predictions = recovered_predictions[-1].reshape(
+            B, secondary_count, 2, 2, 2
+        )
+        primary_predictions = self.four_preds_list[-1].reshape(
+            B, num_crops, 2, 2, 2
+        ).detach()
+        keep_indices = loo_keep_indices(primary_predictions)
+        self.ue_sec_primary_keep_indices = keep_indices
+        std_four_pred = combined_uncertainty(
+            primary_predictions, secondary_predictions, keep_indices
+        )
+        return recovered_predictions, secondary_predictions, std_four_pred
 
     def forward_neg(self, for_training=False):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
