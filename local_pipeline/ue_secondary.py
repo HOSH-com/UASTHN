@@ -58,3 +58,30 @@ def sample_unique_crop_origins(rng, count, max_offset, excluded=None):
             used.add(origin)
             sampled.append(origin)
     return np.asarray(sampled, dtype=np.int64)
+
+
+def sample_cross_crop_origins(rng, max_offset, excluded=None):
+    """Sample one crop in each diagonal quadrant around the center."""
+    if max_offset < 2:
+        raise ValueError("cross crops require at least two pixels of crop movement")
+
+    center = max_offset // 2
+    min_distance = min(center - 1, 30)
+    excluded_set = set(excluded or ())
+    directions = ((-1, 1), (1, 1), (-1, -1), (1, -1))
+    sampled = []
+
+    for x_sign, y_sign in directions:
+        candidates = [
+            (center + x_sign * dx, center + y_sign * dy)
+            for dx in range(min_distance, center)
+            for dy in range(min_distance, center)
+        ]
+        candidates = [origin for origin in candidates if origin not in excluded_set]
+        if not candidates:
+            raise ValueError("no unused crop origin is available for the cross pattern")
+        origin = candidates[int(rng.integers(0, len(candidates)))]
+        sampled.append(origin)
+        excluded_set.add(origin)
+
+    return np.asarray(sampled, dtype=np.int64)

@@ -75,6 +75,8 @@ def _validate_cli_args(args, parser):
             parser.error("--ue_sec crops currently requires --custom satcrop")
         if args.ue_sec_crops_n < 1:
             parser.error("--ue_sec_crops_n must be at least 1")
+        if args.ue_sec_crops_mode == "cross" and args.ue_sec_crops_n != 4:
+            parser.error("--ue_sec_crops_mode cross requires --ue_sec_crops_n 4")
         if args.ue_num_crops < 3:
             parser.error("--ue_sec crops requires --ue_num_crops of at least 3")
     if args.ue_sec == "points" and args.ue_sec_points_n < 2:
@@ -1131,10 +1133,10 @@ Examples:
     parser.add_argument("--ue_sec",type=str,default="none", choices=["none","crops","points"])
     parser.add_argument("--ue_sec_trigger_range", type=float, nargs=2, default=[4.0, 10.0], metavar=("MIN", "MAX"),)
     parser.add_argument("--ue_sec_crops_n", type=int, default=4,
-                       help="Number of additional random crops after removing one LOO outlier")
+                       help="Number of additional crops after removing one LOO outlier")
     parser.add_argument("--ue_sec_points_n",type=int,default=4)
     parser.add_argument("--ue_sec_points_width",type=int,choices=range(40,65),default=48)
-    parser.add_argument("--ue_sec_crops_mode", type=str, default="random", choices=["random"])
+    parser.add_argument("--ue_sec_crops_mode", type=str, default="random", choices=["random", "cross"])
     parser.add_argument("--ue_sec_points_mode",type=str,default="rand",choices=["rand","grid","guided"]) # TODO
     # parser.add_argument(--ue)
 

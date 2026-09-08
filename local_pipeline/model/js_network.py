@@ -26,6 +26,7 @@ from model.js_kornia_replacement import (
 from ue_secondary import (
     combined_uncertainty,
     loo_keep_indices,
+    sample_cross_crop_origins,
     sample_unique_crop_origins,
 )
 
@@ -632,13 +633,9 @@ class UASTHN():
         return four_preds_list, four_pred, std_four_pred
 
     def run_ue_sec_crops(self):
-        """Run K additional random SatCrop predictions after LOO filtering."""
+        """Run additional SatCrop predictions after LOO filtering."""
         if self.args.custom != "satcrop":
             raise NotImplementedError("--ue_sec crops currently supports only --custom satcrop")
-        if self.args.ue_sec_crops_mode != "random":
-            raise NotImplementedError(
-                f"ue_sec_crops_mode='{self.args.ue_sec_crops_mode}' is not implemented"
-            )
 
         num_crops = self.args.ue_num_crops
         secondary_count = self.args.ue_sec_crops_n
@@ -655,9 +652,18 @@ class UASTHN():
             for origin in primary_origins
         }
         max_offset = self.args.database_size_large - self.args.database_size
-        origins = sample_unique_crop_origins(
-            self.ue_rng, secondary_count, max_offset, excluded=excluded
-        )
+        if self.args.ue_sec_crops_mode == "random":
+            origins = sample_unique_crop_origins(
+                self.ue_rng, secondary_count, max_offset, excluded=excluded
+            )
+        elif self.args.ue_sec_crops_mode == "cross":
+            origins = sample_cross_crop_origins(
+                self.ue_rng, max_offset, excluded=excluded
+            )
+        else:
+            raise NotImplementedError(
+                f"ue_sec_crops_mode='{self.args.ue_sec_crops_mode}' is not implemented"
+            )
         x_start = torch.as_tensor(origins[:, 0], device=self.device, dtype=torch.float32)
         y_start = torch.as_tensor(origins[:, 1], device=self.device, dtype=torch.float32)
         widths = torch.full(

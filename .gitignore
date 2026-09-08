@@ -11,3 +11,4 @@ js_config
 .venv
 test.ipynb
 js_plot - *
+.zcode
