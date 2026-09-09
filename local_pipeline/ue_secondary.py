@@ -2,20 +2,28 @@ import numpy as np
 import torch
 
 
-def loo_keep_indices(predictions):
-    """Return indices retained after dropping one LOO center-distance outlier."""
+def loo_keep_indices(predictions, n_remove=1):
+    """Return original indices retained after iterative LOO center filtering."""
     if predictions.ndim != 5 or predictions.shape[2:] != (2, 2, 2):
         raise ValueError("predictions must have shape [batch, samples, 2, 2, 2]")
-    if predictions.shape[1] < 3:
-        raise ValueError("LOO outlier removal requires at least three predictions")
+    sample_count = predictions.shape[1]
+    if n_remove < 0 or n_remove > sample_count - 2:
+        raise ValueError("n_remove must leave at least two predictions")
 
-    centers = predictions.mean(dim=(-1, -2))
-    center_sum = centers.sum(dim=1, keepdim=True)
-    loo_means = (center_sum - centers) / (centers.shape[1] - 1)
-    outlier_indices = torch.linalg.vector_norm(centers - loo_means, dim=-1).argmax(dim=1)
-
-    all_indices = torch.arange(predictions.shape[1], device=predictions.device)
-    return torch.stack([all_indices[all_indices != index] for index in outlier_indices])
+    batch_keep = []
+    for batch_index in range(predictions.shape[0]):
+        keep = torch.arange(sample_count, device=predictions.device)
+        for _ in range(n_remove):
+            current = predictions[batch_index, keep]
+            centers = current.mean(dim=(-1, -2))
+            center_sum = centers.sum(dim=0, keepdim=True)
+            loo_means = (center_sum - centers) / (centers.shape[0] - 1)
+            remove_position = torch.linalg.vector_norm(
+                centers - loo_means, dim=-1
+            ).argmax()
+            keep = torch.cat((keep[:remove_position], keep[remove_position + 1:]))
+        batch_keep.append(keep)
+    return torch.stack(batch_keep)
 
 
 def gather_predictions(predictions, indices):
@@ -25,11 +33,20 @@ def gather_predictions(predictions, indices):
     return predictions.gather(1, gather_index.expand(-1, -1, 2, 2, 2))
 
 
-def combined_uncertainty(primary_predictions, secondary_predictions, keep_indices=None):
-    """Calculate coordinate-wise sample std over retained primary and secondary runs."""
+def combined_uncertainty(
+    primary_predictions,
+    secondary_predictions=None,
+    keep_indices=None,
+    n_remove=0,
+):
+    """Calculate coordinate-wise sample std over a optionally filtered pool."""
     if keep_indices is not None:
         primary_predictions = gather_predictions(primary_predictions, keep_indices)
-    combined = torch.cat((primary_predictions, secondary_predictions), dim=1)
+    combined = primary_predictions
+    if secondary_predictions is not None:
+        combined = torch.cat((combined, secondary_predictions), dim=1)
+    if n_remove:
+        combined = gather_predictions(combined, loo_keep_indices(combined, n_remove))
     if combined.shape[1] < 2:
         raise ValueError("uncertainty requires at least two predictions")
     return combined.std(dim=1)

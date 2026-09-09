@@ -616,7 +616,9 @@ class UASTHN():
 
 
         alpha = self.args.database_size / self.args.resize_width
-        four_preds_list, _, _, _ = self.ue_aggregation(four_preds_list, alpha, False, self.args.check_step)
+        four_preds_list, _, _, _ = self.ue_aggregation(
+            four_preds_list, alpha, False, self.args.check_step, apply_ue1_loo=False
+        )
         four_pred = four_preds_list[-1]
 
         # print('@@@ self.four_pred\n', self.four_pred.shape, self.four_pred)
@@ -628,7 +630,12 @@ class UASTHN():
         primary_predictions = self.four_preds_list[-1].reshape(
             B, num_crops, 2, 2, 2
         )
-        std_four_pred = combined_uncertainty(primary_predictions, combined)
+        std_four_pred = combined_uncertainty(
+            primary_predictions,
+            combined,
+            keep_indices=getattr(self, "primary_loo_keep_indices", None),
+            n_remove=self.args.ue2_loo_n if self.args.ue2_loo else 0,
+        )
 
         return four_preds_list, four_pred, std_four_pred
 
@@ -709,10 +716,12 @@ class UASTHN():
         primary_predictions = self.four_preds_list[-1].reshape(
             B, num_crops, 2, 2, 2
         ).detach()
-        keep_indices = loo_keep_indices(primary_predictions)
-        self.ue_sec_primary_keep_indices = keep_indices
+        self.ue_sec_primary_keep_indices = self.primary_loo_keep_indices
         std_four_pred = combined_uncertainty(
-            primary_predictions, secondary_predictions, keep_indices
+            primary_predictions,
+            secondary_predictions,
+            keep_indices=getattr(self, "primary_loo_keep_indices", None),
+            n_remove=self.args.ue2_loo_n if self.args.ue2_loo else 0,
         )
         return recovered_predictions, secondary_predictions, std_four_pred
 
@@ -1020,7 +1029,7 @@ class UASTHN():
 
         return bbox_s
 
-    def ue_aggregation(self, four_preds_list, alpha, for_training, check_step=-1):
+    def ue_aggregation(self, four_preds_list, alpha, for_training, check_step=-1, apply_ue1_loo=True):
 
         if check_step == -1:
             agg_step = len(four_preds_list)
@@ -1080,8 +1089,18 @@ class UASTHN():
 
         assert four_pred_five_crops is not None
 
-        # UE
-        if self.args.ue_outlier_method != "none" and self.args.ue_outlier_num != 0 and not for_training:
+        # UE1 filtering changes uncertainty only; prediction aggregation remains raw.
+        if apply_ue1_loo:
+            self.primary_loo_keep_indices = None
+        if apply_ue1_loo and getattr(self.args, "ue1_loo", False):
+            self.primary_loo_keep_indices = loo_keep_indices(
+                four_pred_five_crops, self.args.ue1_loo_n
+            )
+            std_four_pred_five_crops = combined_uncertainty(
+                four_pred_five_crops,
+                keep_indices=getattr(self, "primary_loo_keep_indices", None),
+            )
+        elif self.args.ue_outlier_method != "none" and self.args.ue_outlier_num != 0 and not for_training:
             mace_distance = (four_pred_five_crops[:, :1] - four_pred_five_crops)**2  # (D_t - D_ct)^2
             mace_distance = (mace_distance[:, :, 0] + mace_distance[:, :, 1])**0.5  # rad(dx^2 + dy^2)
             mace_distance = mace_distance.mean(dim=2).mean(dim=2)  # mean

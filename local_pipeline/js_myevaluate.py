@@ -79,6 +79,22 @@ def _validate_cli_args(args, parser):
             parser.error("--ue_sec_crops_mode cross requires --ue_sec_crops_n 4")
         if args.ue_num_crops < 3:
             parser.error("--ue_sec crops requires --ue_num_crops of at least 3")
+    if args.ue1_loo:
+        if not args.enable_uncertainty:
+            parser.error("--ue1_loo requires --enable_uncertainty")
+        if args.ue1_loo_n < 1 or args.ue1_loo_n > args.ue_num_crops - 2:
+            parser.error("--ue1_loo_n must leave at least two primary crops")
+    if args.ue2_loo:
+        if args.ue_sec == "none":
+            parser.error("--ue2_loo requires --ue_sec points or crops")
+        secondary_count = (
+            args.ue_sec_crops_n
+            if args.ue_sec == "crops"
+            else args.ue_num_crops * (args.ue_sec_points_n - 1)
+        )
+        primary_count = args.ue_num_crops - (args.ue1_loo_n if args.ue1_loo else 0)
+        if args.ue2_loo_n < 1 or args.ue2_loo_n > primary_count + secondary_count - 2:
+            parser.error("--ue2_loo_n must leave at least two combined predictions")
     if args.ue_sec == "points" and args.ue_sec_points_n < 2:
         parser.error("--ue_sec_points_n must be at least 2")
     return args
@@ -300,8 +316,12 @@ def _build_runtime_args(cli_args):
     args.check_step = cli_args.check_step if cli_args.enable_uncertainty else -1
     args.ue_combine = cli_args.ue_combine if cli_args.enable_uncertainty else "max"
     args.ue_rej_std = cli_args.ue_rej_std if cli_args.enable_uncertainty else [float('inf')]
+    args.ue1_loo = cli_args.ue1_loo
+    args.ue1_loo_n = cli_args.ue1_loo_n
+    args.ue2_loo = cli_args.ue2_loo
+    args.ue2_loo_n = cli_args.ue2_loo_n
 
-    # Outlier settings (used by ue_aggregation)
+    # Legacy outlier settings (used by ue_aggregation)
     args.ue_outlier_method = "none"
     args.ue_outlier_num = 0
 
@@ -1122,6 +1142,14 @@ Examples:
                        help="Merge function for combined uncertainty (max from paper)")
     parser.add_argument("--ue_seed", type=int, default=0,
                        help="Random seed for crop sampling")
+    parser.add_argument("--ue1_loo", action="store_true",
+                       help="Enable iterative LOO outlier removal for primary UE1")
+    parser.add_argument("--ue1_loo_n", type=int, default=1,
+                       help="Number of LOO outliers removed from the UE1 pool")
+    parser.add_argument("--ue2_loo", action="store_true",
+                       help="Enable iterative LOO outlier removal for combined UE2")
+    parser.add_argument("--ue2_loo_n", type=int, default=1,
+                       help="Number of LOO outliers removed from the UE2 pool")
     parser.add_argument("--ue_rej_std", type=float, nargs="+", default=[0.5, 1.0, 2.0],
                        help="Uncertainty rejection thresholds (in pixels)")
     parser.add_argument("--check_step", type=int, default=-1,
