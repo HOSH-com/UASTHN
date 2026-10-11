@@ -975,29 +975,33 @@ class UASTHN():
                 w = torch.tensor([self.args.resize_width] + w_random).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
 
             elif self.args.ue_shift_crops_types in ['plus', 'cross', 'plus_cross']:
+                # Standard (non-satcrop) thermal-crop variant of the plus/cross
+                # sampling. Shifts are expressed in the 256-resized frame around
+                # half of the usable shift range so crop bboxes stay inside it.
+                half_shift = resized_ue_shift / 2
+                MIN_SHIFT = 1
                 x_shift, y_shift = [], []
-                cur_crop_type = self.args.ue_shift_crops_types
+                cur_crop_type = self.args.ue_shift_crops_types if self.args.ue_shift_crops_types != 'plus_cross' else 'plus'
 
                 for i in range(self.args.ue_num_crops - 1):
-                    # TODO add const or rand choice
-                    x_val = self.ue_rng.integers(MIN_SHIFT, half_shift)
-                    y_val = self.ue_rng.integers(MIN_SHIFT, half_shift)
+                    x_val = self.ue_rng.uniform(MIN_SHIFT, half_shift)
+                    y_val = self.ue_rng.uniform(MIN_SHIFT, half_shift)
 
                     if cur_crop_type == "plus":
                         # 4 random plus shape crops (up, left, down, right)
                         x_shift.append(half_shift if i % 2 == 0 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * x_val)
                         y_shift.append(half_shift if i % 2 == 1 else half_shift + (-1 if (i // 2) % 2 == 0 else 1) * y_val)
-                        if self.args.ue_shift_crops_types == 'plus_cross' and i % 8 == 3: 
+                        if self.args.ue_shift_crops_types == 'plus_cross' and i % 8 == 3:
                             cur_crop_type = 'cross'
 
                     elif cur_crop_type == "cross":
                         # 4 random cross shape crops (top-left, top-right, bottom-left, bottom-right)
                         x_shift.append(half_shift + (-1 if i % 2 == 0 else 1) * x_val)
                         y_shift.append(half_shift + (-1 if i % 4 > 1 else 1) * y_val)
-                        if self.args.ue_shift_crops_types == 'plus_cross' and i % 8 == 7: 
+                        if self.args.ue_shift_crops_types == 'plus_cross' and i % 8 == 7:
                             cur_crop_type = 'plus'
 
-                w_random = [self.args.resize_width - self.args.ue_shift for i in range(self.args.ue_num_crops - 1)]
+                w_random = [self.args.resize_width - resized_ue_shift for i in range(self.args.ue_num_crops - 1)]
                 x_shift = torch.tensor([0] + x_shift).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
                 y_shift = torch.tensor([0] + y_shift).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
                 w = torch.tensor([self.args.resize_width] + w_random, dtype=torch.float).repeat(self.image_2.shape[0]//self.args.ue_num_crops).to(self.image_2.device)
